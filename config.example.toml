@@ -1,0 +1,27 @@
+# ============================================================
+# 鸿蒙机会雷达 配置模板
+# 用法: 复制本文件为 config.toml 后按需修改（config.toml 不入库）
+# ============================================================
+
+[llm]
+# OpenAI 兼容接口（本地 vLLM / Ollama / 商用中转均可无缝切换）
+base_url = "http://localhost:8000/v1"   # 本地 vLLM 默认地址
+api_key  = "EMPTY"                      # 本地部署随便填，商用中转填真实 key
+model    = "qwen2.5-coder-32b"          # 打样用本地模型，出看板前换商用精修
+timeout  = 120                          # 秒，本地大模型响应偏慢，给足余量
+
+[capture]
+# ---- Apple 标杆捕获（M1）----
+regions = ["cn", "us"]              # 拉哪些地区的榜单
+charts  = ["top-free", "top-paid"]  # 拉哪些榜单类型
+feed_limit = 100                     # 每个榜单拉取条数（上限 200）
+max_benchmarks = 20                  # LLM 精选后保留的标杆数量上限
+
+[probe]
+# ---- 鸿蒙供给探测（M2，预留）----
+max_comments_per_app = 50            # 每个竞品最多抓多少条评论
+bad_rating_threshold = 3             # rating <= 该值视为中差评
+
+[audit]
+# ---- AI 审计打分（M3，预留）----
+min_score = 6.0                       # 四维总分低于此值的机会直接过滤

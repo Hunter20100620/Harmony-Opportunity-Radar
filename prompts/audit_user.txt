@@ -1,0 +1,32 @@
+请对以下场景进行四维机会审计。以下资料是唯一证据；括号中的“无差评数据”或空白字段代表未知，不代表用户没有问题。输出应便于人工复核。
+
+--- iOS 标杆基础信息 ---
+应用名称: {benchmark_name}
+开发者: {artist}
+JTBD（用户底层任务）: {jtbd}
+入选理由: {pick_reason}
+
+--- 鸿蒙市场供给现状 ---
+是否生态空白: {is_blank}
+竞品数量: {competitor_count}
+{competitor_details}
+
+{recent_bad_reviews}
+
+请按以下 JSON Schema 输出审计结论（只输出 JSON 对象，不要 Markdown 围栏）。四项分数均为 0~10 的一位小数，overall 必须严格按 `demand*0.25 + experience_gap*0.30 + native_advantage*0.25 + indie_feasibility*0.20` 计算并四舍五入到一位小数:
+{{
+  "scores": {{
+    "demand": <0-10 浮点数>,
+    "experience_gap": <0-10 浮点数>,
+    "native_advantage": <0-10 浮点数>,
+    "indie_feasibility": <0-10 浮点数>,
+    "overall": <由权重计算的综合得分>
+  }},
+  "verdict": "<一句话定性判断，说明主要证据、最大不确定性或是否值得进入人工验证>",
+  "native_features": [
+    "<推荐的鸿蒙原生落地功能点 1，如: 实况窗显示倒计时进度>",
+    "<推荐的鸿蒙原生落地功能点 2>"
+  ],
+  "attack_vector": "<突破切入点：必须对应输入中的差评/供给空白；证据不足写待验证>",
+  "indie_advice": "<针对个人开发者的 MVP 范围、验证动作和风险；不得承诺两周必然完成>"
+}}
