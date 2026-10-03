@@ -4,6 +4,10 @@ config.toml
 # 运行产物 / 中间数据
 data/
 
+# 一次性实验产物与调试脚本（不入库）
+poc/out/
+poc/debug_*.py
+
 # Python 缓存
 __pycache__/
 *.py[cod]
