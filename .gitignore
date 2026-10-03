@@ -25,6 +25,7 @@ env/
 .env.*
 
 # 本地会话 / 规划文档（不入库）
+VISION.md
 kilo.jsonc
 SPEC.md
 SESSION_STATE.md
