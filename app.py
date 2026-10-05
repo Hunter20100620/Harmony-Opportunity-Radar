@@ -124,7 +124,7 @@ section[data-testid="stSidebar"]{ background:var(--bg-1) !important; border-righ
 
 /* 运行概览指标条：单一共享表面 + 竖分隔，取代并排卡片。
    颜色只编码"这份数字有多强"，不按指标轮换色相 —— 琥珀留给生态空白 */
-.statline{ display:grid; grid-template-columns:repeat(5,minmax(0,1fr));
+.statline{ display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr));
   background:var(--surface-1); border:1px solid var(--border-1); border-radius:var(--radius); }
 .stat{ padding:13px 16px; border-left:1px solid var(--border-1); min-width:0; }
 .stat:first-child{ border-left:none; }
@@ -602,8 +602,11 @@ def _load_all(batch_id: str | None = None):
     bench, bench_err = reader("benchmarks.json")
     probe, probe_err = reader("probe.json")
     opps, opp_err = reader("opportunities.json")
-    errors = [e for e in (feed_err, bench_err, probe_err, opp_err) if e]
-    return feed, bench, probe, opps, errors
+    audits, audits_err = reader("audit_results.json")
+    review, review_err = reader("review_queue.json")
+    errors = [e for e in (feed_err, bench_err, probe_err, opp_err,
+                          audits_err, review_err) if e]
+    return feed, bench, probe, opps, audits, review, errors
 
 
 def _history_options() -> list[str]:
@@ -631,6 +634,8 @@ def _artifact_rows(batch_id: str | None = None):
         ("benchmarks.json", "精选标杆", "captured_at", "benchmarks"),
         ("probe.json", "鸿蒙供给探测", "probed_at", "benchmarks"),
         ("opportunities.json", "机会审计结果", "audited_at", "opportunities"),
+        ("audit_results.json", "完整审计结果", "audited_at", "audits"),
+        ("review_queue.json", "人工复核队列", "generated_at", "items"),
     ]
     rows = []
     for filename, title, ts_key, list_key in specs:
@@ -957,16 +962,27 @@ def sidebar_panel(cfg):
 # --------------------------------------------------------------------------
 # 标签 1：机会总览
 # --------------------------------------------------------------------------
-def render_kpi_row(opportunities, min_score):
+def render_kpi_row(opportunities, min_score, audit_meta=None, review_meta=None,
+                   probe_data=None):
     passed = _passed(opportunities, min_score)
     blanks = [o for o in passed if o.get("is_blank")]
     high = [o for o in passed if _overall(o) >= 8.0]
     avg = sum(_overall(o) for o in passed) / len(passed) if passed else 0.0
+    total_audited = (audit_meta or {}).get("total_audited", len(opportunities))
+    review_count = (review_meta or {}).get("count", 0)
+    # 生态空白与请求错误来自 probe 状态，绝不含糊
+    probe_records = (probe_data or {}).get("benchmarks", []) if isinstance(probe_data, dict) else []
+    confirmed_empty = sum(1 for r in probe_records
+                          if r.get("probe_status") == "confirmed_empty")
+    request_errors = sum(1 for r in probe_records
+                         if r.get("probe_status") == "request_error")
     cards = [
-        ("审计标杆总数", str(len(opportunities)), "四维审计覆盖范围", ""),
-        ("达到门槛", str(len(passed)), f"综合分 ≥ {min_score:.1f}", "sig"),
+        ("审计总数", str(total_audited), "四维审计覆盖范围", ""),
+        ("达标机会", str(len(passed)), f"综合分 ≥ {min_score:.1f}", "sig"),
         ("高优机会", str(len(high)), "综合分 ≥ 8.0", ""),
-        ("生态空白", str(len(blanks)), "无真实同类竞品", "gap"),
+        ("确认空白", str(confirmed_empty), "检索确认无同类", "gap"),
+        ("人工复核", str(review_count), "低证据/临界项", ""),
+        ("请求错误", str(request_errors), "检索失败，非空白", ""),
         ("平均综合分", f"{avg:.1f}", "仅统计达标机会", ""),
     ]
     cells = "".join(
@@ -1100,9 +1116,16 @@ def render_deep_card(opp):
     avg_score = f"{sum(scores_num) / len(scores_num):.1f}" if scores_num else "—"
 
     pill = '<span class="pill pill-blank">生态空白</span>' if blank else ""
+    grade = opp.get("evidence_grade", "")
+    grade_pill = (f'<span class="pill">证据 {html.escape(str(grade))}</span>'
+                  if grade else "")
+    status = opp.get("probe_status", "")
+    status_pill = (f'<span class="pill">状态 {html.escape(str(status))}</span>'
+                   if status else "")
     st.markdown(
         f'<div class="detail-head"><span class="detail-name">'
         f'{html.escape(str(opp.get("benchmark_name", "?")))}</span>{pill}'
+        f'{grade_pill}{status_pill}'
         f'<span class="badge {_score_class(overall)}">{overall:.1f}</span>'
         f'<span class="muted">by {html.escape(str(opp.get("artist") or "—"))}</span></div>',
         unsafe_allow_html=True,
@@ -1139,6 +1162,8 @@ def render_deep_card(opp):
             unsafe_allow_html=True,
         )
     else:
+        review_total = sum(
+            int((c.get("comment_stats") or {}).get("fetched") or 0) for c in comps)
         st.markdown(
             '<div class="facts">'
             f'<div class="fact"><div class="fact-k">同类竞品</div>'
@@ -1147,6 +1172,10 @@ def render_deep_card(opp):
             f'<div class="fact-v">{avg_score}</div></div>'
             f'<div class="fact"><div class="fact-k">差评样本</div>'
             f'<div class="fact-v" style="color:var(--amber)">{bad_total}</div></div>'
+            f'<div class="fact"><div class="fact-k">评论采样</div>'
+            f'<div class="fact-v">{review_total}</div></div>'
+            f'<div class="fact"><div class="fact-k">证据等级</div>'
+            f'<div class="fact-v">{_fact_value(grade)}</div></div>'
             '</div>',
             unsafe_allow_html=True,
         )
@@ -1208,9 +1237,41 @@ def render_details(opportunities, min_score):
         render_deep_card(options[choice])
 
 
+def render_review_queue(review_meta, audit_meta):
+    """人工复核队列：展示请求错误、低证据与临界项，供人工定夺。"""
+    items = (review_meta or {}).get("items", []) if isinstance(review_meta, dict) else []
+    if not items:
+        _empty_state("当前无需人工复核", "所有审计项证据充分或已达标。",
+                     "python -m radar audit")
+        return
+    st.markdown(
+        f'<div class="muted">共 {len(items)} 项待人工复核：请求错误、LLM 过滤失败、'
+        f'低证据等级或临界分数。这些项不会被当作生态空白或高潜机会。</div>',
+        unsafe_allow_html=True,
+    )
+    for i, item in enumerate(items):
+        with st.container(key=f"review_card_{i}"):
+            title = item.get("benchmark_name", "?")
+            grade = item.get("evidence_grade", "")
+            status = item.get("probe_status", "")
+            reasons = "、".join(item.get("reason_codes", []))
+            st.markdown(
+                f'<div class="muted"><b>{html.escape(str(title))}</b> '
+                f'· 证据 {html.escape(str(grade))} · 状态 {html.escape(str(status))} '
+                f'· 原因 {html.escape(reasons)}</div>',
+                unsafe_allow_html=True,
+            )
+            for q in item.get("review_questions", []):
+                st.caption(q)
+
+
 def render_ecosystem(opportunities, min_score):
+    # 仅接受「确认空白」：排除请求错误与未验证的 LLM 结果
     blanks = sorted(
-        [o for o in opportunities if o.get("is_blank") and _overall(o) >= min_score],
+        [o for o in opportunities
+         if o.get("is_blank")
+         and o.get("probe_status", "") != "request_error"
+         and _overall(o) >= min_score],
         key=_overall,
         reverse=True,
     )
@@ -1248,6 +1309,8 @@ def _config_from_form(form):
             "max_comments_per_app": int(form["max_comments_per_app"]),
             "bad_rating_threshold": int(form["bad_rating_threshold"]),
             "max_competitors": int(form["max_competitors"]),
+            "max_keywords_per_benchmark": int(form["max_keywords_per_benchmark"]),
+            "comment_pages": int(form["comment_pages"]),
             "filter_candidates_limit": int(form["filter_candidates_limit"]),
             "enable_llm_filter": bool(form["enable_llm_filter"]),
         },
@@ -1291,6 +1354,11 @@ def _render_config_form(cfg):
                                                value=int(prb.get("bad_rating_threshold", 3)), step=1)
         max_competitors = st.number_input("单标杆最大竞品数", min_value=1, max_value=20,
                                           value=int(prb.get("max_competitors", 3)), step=1)
+        max_keywords_per_benchmark = st.number_input(
+            "单标杆最大关键词数", min_value=1, max_value=8,
+            value=int(prb.get("max_keywords_per_benchmark", 4)), step=1)
+        comment_pages = st.number_input("评论抓取页数", min_value=1, max_value=20,
+                                        value=int(prb.get("comment_pages", 4)), step=1)
         filter_candidates_limit = st.number_input("LLM 候选过滤上限", min_value=1, max_value=50,
                                                   value=int(prb.get("filter_candidates_limit", 8)), step=1)
         enable_llm_filter = st.checkbox("启用 LLM 语义去噪", value=bool(prb.get("enable_llm_filter", True)))
@@ -1311,6 +1379,8 @@ def _render_config_form(cfg):
             "regions": regions, "charts": charts, "feed_limit": feed_limit,
             "max_benchmarks": max_benchmarks, "max_comments_per_app": max_comments_per_app,
             "bad_rating_threshold": bad_rating_threshold, "max_competitors": max_competitors,
+            "max_keywords_per_benchmark": max_keywords_per_benchmark,
+            "comment_pages": comment_pages,
             "filter_candidates_limit": filter_candidates_limit,
             "enable_llm_filter": enable_llm_filter, "min_score": min_score,
         })
@@ -1529,9 +1599,11 @@ def main():
     with st.container(key="history_bar"):
         batch_id = render_history_selector()
 
-    feed, bench, probe, opps, errors = _load_all(batch_id)
+    feed, bench, probe, opps, audits, review, errors = _load_all(batch_id)
     opportunities = (opps or {}).get("opportunities", []) if isinstance(opps, dict) else []
     opp_meta = opps if isinstance(opps, dict) else None
+    audit_meta = audits if isinstance(audits, dict) else None
+    review_meta = review if isinstance(review, dict) else None
 
     for err in errors:
         st.error(err)
@@ -1546,8 +1618,8 @@ def main():
     render_run_strip()
     st.markdown("---")
 
-    t1, t2, t3, t4, t5 = st.tabs(
-        ["机会总览", "机会详情", "生态空白", "提示词微调", "控制台"])
+    t1, t2, t3, t_review, t4, t5 = st.tabs(
+        ["机会总览", "机会详情", "生态空白", "人工复核", "提示词微调", "控制台"])
 
     with t1:
         if opps is None:
@@ -1557,7 +1629,7 @@ def main():
             _empty_state("已审计但无机会记录", "审计结果为空，检查前序产物后重新运行审计。",
                          "python -m radar audit")
         else:
-            render_kpi_row(opportunities, min_score)
+            render_kpi_row(opportunities, min_score, audit_meta, review_meta, probe)
             st.markdown("")
             render_ladder(opportunities, min_score)
             render_report_section(opp_meta, batch_id)
@@ -1574,6 +1646,9 @@ def main():
             _empty_state("暂无可查看的生态空白", "先完成一次审计。", "python -m radar audit")
         else:
             render_ecosystem(opportunities, min_score)
+
+    with t_review:
+        render_review_queue(review_meta, audit_meta)
 
     with t4:
         render_prompts()

@@ -7,6 +7,11 @@
 - 综合得分 = Demand×0.25 + ExperienceGap×0.30 + NativeAdvantage×0.25 + IndieFeasibility×0.20
 - overall 必须由四个分数按上述公式计算，不能凭主观印象覆盖公式结果。
 
+证据等级与状态纪律：
+- 输入中的 probe_status / evidence_grade / query_stats 是检索证据的权威描述。
+- request_error、llm_filter_failed、no_search_results 均**不是**确认空白；这些状态下 experience_gap 不得当作生态空白给高分。
+- 证据等级 D 时 experience_gap 上限 4.0；C 时上限 7.0；代码层会强制封顶，不要试图绕过。
+
 四维定义:
 1. **Demand（需求验证分）**:
     - 只能依据 JTBD 的场景清晰度和输入中可观察的榜单信号；榜单名次不是用户规模证明。证据不足时取 4~6。
@@ -28,5 +33,9 @@
     - 需要账户、同步、复杂内容、持续数据源或未证实的系统能力时降分；信息不足取 4~6。
 
 输出内容要求：native_features 只列 0~3 个与场景直接相关的候选能力；没有可靠匹配时输出空数组。attack_vector 必须对应输入中的差评或检索空白；没有对应证据时写“待验证”，不要发明痛点。
+
+评论证据纪律：
+- 竞品评论样本量很小、缺失或抓取失败（review_evidence 为 insufficient/missing/request_error）时，视为“未知”，不得据此判断用户没有痛点，也不得给 experience_gap 高分。
+- 只有输入中明确出现重复差评或确认空白时，才可把 attack_vector 写成具体切入点；否则一律写“待验证”。
 
 必须只输出 JSON，不要任何额外文字解释。

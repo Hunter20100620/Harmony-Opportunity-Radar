@@ -45,6 +45,9 @@ _CAPTURE_SYSTEM = """你是“鸿蒙机会雷达”的榜单筛选器。你的�
 
 输出纪律：
 - 只能使用输入字段中的应用名、开发者、Apple ID、榜内名次；应用的任务可从名称做最小必要抽象，但不得补写未经输入证明的功能。
+- 输入榜单可能被截断（只含前若干条），不得把截断当作“市场只有这些应用”。
+- apple_id 必须原样回填；若无法确定，宁可为空，不要编造。
+- 仅凭名称无法证明功能细节，JTBD 必须保守，不得补写输入没有支持的能力。
 - 不要把“高审美”“精品”“独立开发”等当作事实断言；pick_reason 只能说明“为何适合作为研究标杆”。
 - 只输出合法 JSON，不要 Markdown、解释、注释或尾随逗号。"""
 
@@ -73,7 +76,9 @@ _PROBE_FILTER_SYSTEM = """你是严格的竞品语义过滤器。根据标杆的
 - 仅关键词相同、同属大类、或能作为替代品但解决的是另一任务，不算同类。
 - category、name、intro 只代表输入线索；缺少足够证据时剔除，不能用常识补全功能。
 - 永久剔除游戏、金融证券、社交、电商、视频/资讯、泛平台工具，以及明显的广告/下载/壁纸/清理类噪声。
-- 最多保留 3 个，按 JTBD 契合度排序；没有确定匹配就返回空数组。
+- 按 JTBD 契合度排序，保留数量不超过用户消息中的上限；没有确定匹配就返回空数组。
+- 合法的空数组 `[]` 表示「没有确认的同类竞品」；格式异常（缺字段、非数组、无法解析）不等于空数组。
+- package 必须从候选列表中逐字复制；不确定时不得输出，更不得把不确定转写成「市场不存在」的结论。
 
 只输出合法 JSON 数组（包名字符串），不要解释、Markdown 或其他字段。"""
 
@@ -85,7 +90,7 @@ _PROBE_FILTER_USER = """请判断以下候选应用中，哪些与标杆产品�
 华为应用市场候选列表（每项含 name/category/package/intro，字段可能为空）:
 {candidates_json}
 
-返回 JSON 数组，只包含候选列表中原样出现的 `package` 字符串，按契合度排序，最多 3 个。不得改写包名、不得输出列表外包名；无确定匹配则返回 `[]`。"""
+返回 JSON 数组，只包含候选列表中原样出现的 `package` 字符串，按契合度排序，最多 {max_competitors} 个。不得改写包名、不得输出列表外包名。若确无同类，返回合法空数组 `[]`；格式异常不得伪装成 `[]`。不确定时宁可不输出，也不要把不确定当作「市场不存在」的结论。"""
 
 _PROBE_PAIN_SYSTEM = """你是用户反馈编码器。把输入的真实低分评论归并为可用于产品决策的痛点，不负责替用户解释动机，也不负责提出解决方案。
 
@@ -125,6 +130,11 @@ _AUDIT_SYSTEM = """你是“鸿蒙机会雷达”的保守型机会审计员，�
 - 综合得分 = Demand×0.25 + ExperienceGap×0.30 + NativeAdvantage×0.25 + IndieFeasibility×0.20
 - overall 必须由四个分数按上述公式计算，不能凭主观印象覆盖公式结果。
 
+证据等级与状态纪律：
+- 输入中的 probe_status / evidence_grade / query_stats 是检索证据的权威描述。
+- request_error、llm_filter_failed、no_search_results 均**不是**确认空白；这些状态下 experience_gap 不得当作生态空白给高分。
+- 证据等级 D 时 experience_gap 上限 4.0；C 时上限 7.0；代码层会强制封顶，不要试图绕过。
+
 四维定义:
 1. **Demand（需求验证分）**:
     - 只能依据 JTBD 的场景清晰度和输入中可观察的榜单信号；榜单名次不是用户规模证明。证据不足时取 4~6。
@@ -147,6 +157,10 @@ _AUDIT_SYSTEM = """你是“鸿蒙机会雷达”的保守型机会审计员，�
 
 输出内容要求：native_features 只列 0~3 个与场景直接相关的候选能力；没有可靠匹配时输出空数组。attack_vector 必须对应输入中的差评或检索空白；没有对应证据时写“待验证”，不要发明痛点。
 
+评论证据纪律：
+- 竞品评论样本量很小、缺失或抓取失败（review_evidence 为 insufficient/missing/request_error）时，视为“未知”，不得据此判断用户没有痛点，也不得给 experience_gap 高分。
+- 只有输入中明确出现重复差评或确认空白时，才可把 attack_vector 写成具体切入点；否则一律写“待验证”。
+
 必须只输出 JSON，不要任何额外文字解释。"""
 
 _AUDIT_USER = """请对以下场景进行四维机会审计。以下资料是唯一证据；括号中的“无差评数据”或空白字段代表未知，不代表用户没有问题。输出应便于人工复核。
@@ -158,6 +172,11 @@ JTBD（用户底层任务）: {jtbd}
 入选理由: {pick_reason}
 
 --- 鸿蒙市场供给现状 ---
+探测状态: {probe_status}
+证据等级: {evidence_grade}
+空白置信度: {blank_confidence}
+检索统计(请求/成功/失败/非空): {query_stats}
+检索错误: {search_errors}
 是否生态空白: {is_blank}
 竞品数量: {competitor_count}
 {competitor_details}
@@ -191,7 +210,8 @@ PROMPT_TEMPLATES: dict[str, dict] = {
     "probe_filter_system": _spec("竞品语义过滤 · System", "M2 probe", "system",
                                  _PROBE_FILTER_SYSTEM),
     "probe_filter_user": _spec("竞品语义过滤 · User", "M2 probe", "user", _PROBE_FILTER_USER,
-                               ["benchmark_name", "benchmark_jtbd", "candidates_json"]),
+                               ["benchmark_name", "benchmark_jtbd", "candidates_json",
+                                "max_competitors"]),
     "probe_pain_system": _spec("差评痛点提炼 · System", "M2 probe", "system",
                                _PROBE_PAIN_SYSTEM),
     "probe_pain_user": _spec("差评痛点提炼 · User", "M2 probe", "user", _PROBE_PAIN_USER,
@@ -199,7 +219,9 @@ PROMPT_TEMPLATES: dict[str, dict] = {
     "audit_system": _spec("四维机会审计 · System", "M3 audit", "system", _AUDIT_SYSTEM),
     "audit_user": _spec("四维机会审计 · User", "M3 audit", "user", _AUDIT_USER,
                         ["benchmark_name", "artist", "jtbd", "pick_reason", "is_blank",
-                         "competitor_count", "competitor_details", "recent_bad_reviews"]),
+                         "competitor_count", "competitor_details", "recent_bad_reviews",
+                         "probe_status", "evidence_grade", "query_stats", "search_errors",
+                         "blank_confidence"]),
 }
 
 # 真实占位符：单花括号 {name}；`{{`/`}}` 是 .format() 的字面量转义，不算占位符

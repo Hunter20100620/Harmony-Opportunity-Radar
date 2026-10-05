@@ -27,7 +27,8 @@ LATEST_POINTER = DATA_DIR / "latest.json"
 STAGE_OUTPUTS = {
     "capture": ["raw_feed.json", "benchmarks.json"],
     "probe": ["probe.json"],
-    "audit": ["opportunities.json", "report.md"],
+    "audit": ["audit_results.json", "opportunities.json", "review_queue.json",
+              "report.md"],
 }
 
 # 单步重跑需要从上游批次继承的产物
@@ -39,7 +40,8 @@ STAGE_INPUTS = {
 
 # 批次内所有可能的产物文件
 ALL_ARTIFACTS = ["raw_feed.json", "benchmarks.json", "probe.json",
-                 "opportunities.json", "report.md"]
+                 "audit_results.json", "opportunities.json", "review_queue.json",
+                 "report.md"]
 
 # 当前活跃批次（None 表示直接写顶层，兼容旧行为）
 _active_batch = None
@@ -301,6 +303,28 @@ def clear_active() -> None:
     _active_batch = None
 
 
+def summarize_quality(probe_records: list[dict] | None,
+                      audits: list[dict] | None,
+                      failed: int = 0, invalid: int = 0) -> dict:
+    """汇总批次质量计数，供 meta.json 记录；绝不含任何密钥。"""
+    records = probe_records or []
+    audits = audits or []
+    return {
+        "request_errors": sum(1 for r in records
+                              if r.get("probe_status") == "request_error"),
+        "llm_filter_failures": sum(1 for r in records
+                                   if r.get("probe_status") == "llm_filter_failed"),
+        "weak_evidence": sum(1 for r in records
+                             if r.get("probe_status") == "weak_evidence"),
+        "confirmed_empty": sum(1 for r in records
+                               if r.get("probe_status") == "confirmed_empty"),
+        "overall_mismatch": sum(1 for a in audits
+                                if a.get("overall_consistent") is False),
+        "failed": int(failed),
+        "invalid": int(invalid),
+    }
+
+
 def _slim_config(cfg: dict | None) -> dict:
     """批次 meta 里保存的精简配置（不含 api_key）。"""
     if not cfg:
@@ -368,13 +392,33 @@ def load_probe(default=None):
 
 
 def save_opportunities(data) -> str:
-    """audit 阶段最终产物：结构化高潜机会清单。"""
+    """audit 阶段最终产物：结构化高潜机会清单（仅达标项）。"""
     return save_json("opportunities.json", data)
 
 
 def load_opportunities(default=None):
     """读取机会清单。"""
     return load_json("opportunities.json", default)
+
+
+def save_audit_results(data) -> str:
+    """audit 阶段完整审计产物：全部有效审计结果（含未达标项）。"""
+    return save_json("audit_results.json", data)
+
+
+def load_audit_results(default=None):
+    """读取完整审计结果。"""
+    return load_json("audit_results.json", default)
+
+
+def save_review_queue(data) -> str:
+    """audit 阶段人工复核队列：低证据/请求错误/临界项。"""
+    return save_json("review_queue.json", data)
+
+
+def load_review_queue(default=None):
+    """读取人工复核队列。"""
+    return load_json("review_queue.json", default)
 
 
 def save_report(markdown: str) -> str:

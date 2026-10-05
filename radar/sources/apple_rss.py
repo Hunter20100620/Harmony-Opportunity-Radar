@@ -58,12 +58,13 @@ def fetch_chart(region: str, chart: str, limit: int = 100) -> list[dict]:
 
 
 def fetch_all(regions: list[str], charts: list[str], limit: int = 100) -> list[dict]:
-    """拉取多个地区 × 多个榜单的全部应用，跨榜单去重（按应用名）。
+    """拉取多个地区 × 多个榜单的全部应用，按 apple_id 主键去重。
 
-    去重规则: 同名应用只保留首个出现（rank 更靠前的榜单优先，
-    顺序取决于 regions×charts 的传入顺序），并合并其出现来源。
+    去重规则: 优先用 apple_id 作为主键（缺失时回退到名称小写），
+    同名不同 apple_id 的应用各自保留，避免名称去重造成静默信息丢失；
+    合并其出现来源，并保留原始来源字段。
     """
-    seen: dict[str, dict] = {}  # name -> app（跨榜去重用）
+    seen: dict[str, dict] = {}  # key -> app（跨榜去重用）
     for region in regions:
         for chart in charts:
             try:
@@ -73,9 +74,12 @@ def fetch_all(regions: list[str], charts: list[str], limit: int = 100) -> list[d
                 print(f"[warn] 拉取 {region}/{chart} 失败: {e}")
                 continue
             for app in batch:
-                key = app["name"].lower()
+                aid = str(app.get("apple_id", "") or "").strip()
+                key = f"id:{aid}" if aid else f"name:{app['name'].lower()}"
                 if key in seen:
                     seen[key]["source"] += f", {app['source']}"  # 合并来源
+                    seen[key]["source_charts"] = seen[key].get("source_charts", []) + [app["source"]]
                 else:
+                    app["source_charts"] = [app["source"]]
                     seen[key] = app
     return list(seen.values())

@@ -18,6 +18,7 @@
     则抛出 PipelineAbortError，**绝不**写入空产物覆盖有效历史数据。
 """
 import json
+import math
 
 from radar import store, telemetry
 from radar.config import load_config
@@ -45,7 +46,9 @@ def run(cfg: dict | None = None) -> int:
 
     llm = LLMClient(cfg["llm"], stage=STAGE)
 
-    opportunities = []
+    all_audits: list[dict] = []
+    passed_opportunities: list[dict] = []
+    rejected_audits: list[dict] = []
     idx_map = _build_benchmark_index(benchmarks_list)
 
     total = len(benchmarks_list)
@@ -89,33 +92,73 @@ def run(cfg: dict | None = None) -> int:
         print(f"          综合得分: {overall:.1f} {tag}")
         telemetry.progress(STAGE, i, current=name, message=f"{overall:.1f} {tag}")
 
-        opportunities.append(audit_item)
+        all_audits.append(audit_item)
+        if passed:
+            passed_opportunities.append(audit_item)
+        else:
+            rejected_audits.append(audit_item)
+
+    # 完整审计产物：无论是否达标都保留全部有效结果，便于人工复核
+    audit_results = {
+        "audited_at": store._now(),
+        "model": cfg.get("llm", {}).get("model", ""),
+        "min_score": min_score,
+        "total_audited": len(all_audits),
+        "total_passed": len(passed_opportunities),
+        "total_rejected": len(rejected_audits),
+        "failed": failed,
+        "invalid": invalid,
+        "audits": sorted(all_audits, key=lambda x: x["scores"]["overall"], reverse=True),
+    }
+    store.save_audit_results(audit_results)
+
+    # 人工复核队列：在熔断前生成，保证失败批次里低证据项仍可追溯
+    review_queue = _build_review_queue(all_audits, probe_data.get("benchmarks", []),
+                                       min_score)
+    store.save_review_queue({
+        "generated_at": store._now(),
+        "count": len(review_queue),
+        "items": review_queue,
+    })
+
+    # 批次质量统计写入 meta（不含任何密钥）
+    batch = store.active_batch()
+    if batch is not None:
+        batch.meta["quality"] = store.summarize_quality(
+            probe_data.get("benchmarks", []), all_audits, failed, invalid)
+        batch._write_meta()
 
     # ---- 熔断保护：绝不用空/无效结果覆写历史 ----
-    if not opportunities:
-        if failed == total:
-            reason = f"全部 {total} 个标杆的 LLM 审计调用均失败"
-        elif failed + invalid == total:
-            reason = f"全部 {total} 个标杆均未产出有效审计结果（失败 {failed} / 格式异常 {invalid}）"
+    if not passed_opportunities:
+        if not all_audits:
+            if failed == total:
+                reason = f"全部 {total} 个标杆的 LLM 审计调用均失败"
+            elif failed + invalid == total:
+                reason = f"全部 {total} 个标杆均未产出有效审计结果（失败 {failed} / 格式异常 {invalid}）"
+            else:
+                reason = f"审计产出为空（失败 {failed} / 格式异常 {invalid} / 总数 {total}）"
         else:
-            reason = f"审计产出为空（失败 {failed} / 格式异常 {invalid} / 总数 {total}）"
+            reason = (f"{len(all_audits)} 个有效审计结果全部低于门槛 {min_score}"
+                      f"（失败 {failed} / 格式异常 {invalid}）")
         raise PipelineAbortError(
             f"{reason}，触发熔断：已保留历史 data/opportunities.json 不被覆盖。"
             f"请检查 LLM 服务（{cfg['llm']['base_url']}）后重试。"
         )
 
     # 按综合得分降序排列
-    opportunities.sort(key=lambda x: x["scores"]["overall"], reverse=True)
+    passed_opportunities.sort(key=lambda x: x["scores"]["overall"], reverse=True)
 
     opp_data = {
         "audited_at": store._now(),
         "model": cfg.get("llm", {}).get("model", ""),
         "min_score": min_score,
-        "total_audited": len(opportunities),
-        "opportunities": opportunities,
+        "total_audited": len(all_audits),
+        "total_passed": len(passed_opportunities),
+        "total_rejected": len(rejected_audits),
+        "opportunities": passed_opportunities,
     }
     store.save_opportunities(opp_data)
-    print(f"\n=== audit 完成: {len(opportunities)} 个高潜机会保存到 opportunities.json ===")
+    print(f"\n=== audit 完成: {len(passed_opportunities)} 个高潜机会保存到 opportunities.json ===")
 
     # 渲染决策看板
     markdown = _render_markdown_report(opp_data, cfg)
@@ -124,8 +167,8 @@ def run(cfg: dict | None = None) -> int:
 
     if telemetry.current():
         telemetry.current().stage_done(
-            STAGE, f"{len(opportunities)} 个高潜机会（失败 {failed} / 异常 {invalid}）")
-    return len(opportunities)
+            STAGE, f"{len(passed_opportunities)} 个高潜机会（失败 {failed} / 异常 {invalid}）")
+    return len(passed_opportunities)
 
 
 def _load_or_fail(stage: str) -> dict:
@@ -166,6 +209,11 @@ def _match_probe(probe_idx: dict, bm: dict, bm_idx: dict) -> dict | None:
     return None
 
 
+# 证据不足或请求失败的状态：不得在提示词中标记为「生态空白」
+_NON_BLANK_STATUSES = ("request_error", "llm_filter_failed",
+                       "weak_evidence", "no_search_results", "partial")
+
+
 def _build_audit_context(bm: dict, probe_record: dict | None) -> dict:
     """构建审计输入上下文。（注意：此函数名内含下划线，用户调用时勿漏。）"""
     is_blank = True
@@ -173,8 +221,22 @@ def _build_audit_context(bm: dict, probe_record: dict | None) -> dict:
     competitor_details = "（无竞品，鸿蒙生态空白）"
     recent_bad_reviews = "--- 差评痛点 ---\n（无差评数据）"
 
+    probe_status = "unknown"
+    evidence_grade = ""
+    query_stats = {}
+    search_errors: list = []
+    blank_confidence = ""
+
     if probe_record:
         is_blank = probe_record.get("blank_signal", False)
+        probe_status = probe_record.get("probe_status", "unknown")
+        evidence_grade = probe_record.get("evidence_grade", "")
+        query_stats = probe_record.get("query_stats", {}) or {}
+        search_errors = probe_record.get("search_errors", []) or []
+        blank_confidence = probe_record.get("blank_confidence", "")
+        # 请求失败 / LLM 过滤失败 / 证据不足：绝不标记为生态空白
+        if probe_status in _NON_BLANK_STATUSES:
+            is_blank = False
         competitors = probe_record.get("competitors", [])
         competitor_count = len(competitors)
 
@@ -182,10 +244,13 @@ def _build_audit_context(bm: dict, probe_record: dict | None) -> dict:
             lines = []
             for c in competitors:
                 bad_n = len(c.get("bad_reviews", []))
+                cs = c.get("comment_stats", {}) or {}
+                evidence = c.get("review_evidence", "missing")
                 lines.append(
                     f"  - {c.get('name', '?')} | 评分: {c.get('score', '?')} "
                     f"| 下载: {c.get('downloads', '?')} "
-                    f"| 差评: {bad_n}条"
+                    f"| 差评: {bad_n}条 "
+                    f"| 评论样本: {cs.get('fetched', 0)}条(证据:{evidence})"
                 )
             competitor_details = "\n".join(lines) if lines else "（竞品信息缺失）"
 
@@ -204,16 +269,86 @@ def _build_audit_context(bm: dict, probe_record: dict | None) -> dict:
             if pain_parts:
                 recent_bad_reviews = "--- 差评痛点 ---\n" + "\n".join(pain_parts)
 
+    if probe_status in _NON_BLANK_STATUSES:
+        is_blank_text = "否（证据不足）"
+    else:
+        is_blank_text = "是" if is_blank else "否"
+
     return {
         "benchmark_name": bm.get("name", ""),
         "artist": bm.get("artist", ""),
         "jtbd": bm.get("jtbd", ""),
         "pick_reason": bm.get("pick_reason", ""),
-        "is_blank": "是" if is_blank else "否",
+        "is_blank": is_blank_text,
         "competitor_count": str(competitor_count),
         "competitor_details": competitor_details,
         "recent_bad_reviews": recent_bad_reviews,
+        "probe_status": probe_status,
+        "evidence_grade": evidence_grade,
+        "query_stats": json.dumps(query_stats, ensure_ascii=False),
+        "search_errors": json.dumps(search_errors, ensure_ascii=False),
+        "blank_confidence": blank_confidence,
     }
+
+
+_REQUIRED_DIMENSIONS = ("demand", "experience_gap",
+                        "native_advantage", "indie_feasibility")
+
+
+def _parse_dimensions(scores: dict) -> tuple[float, float, float, float] | None:
+    """解析并校验四个必需维度，任一非法即返回 None。
+
+    拒绝布尔值、非数字、非有限值（NaN/Inf）以及超出 [0, 10] 的值。
+    """
+    values = []
+    for key in _REQUIRED_DIMENSIONS:
+        val = scores.get(key)
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            return None
+        v = float(val)
+        if not math.isfinite(v) or not (0.0 <= v <= 10.0):
+            return None
+        values.append(v)
+    return tuple(values)  # type: ignore[return-value]
+
+
+# 证据等级 → experience_gap 保守上限（None 表示不额外封顶）
+_GAP_CAPS = {"D": 4.0, "C": 7.0, "B": None, "A": None}
+
+
+def _apply_evidence_caps(audit_item: dict, probe_record: dict | None) -> dict:
+    """依据证据等级对 experience_gap 施加代码级保守上限，并重算 overall。
+
+    上限只在真正降低分数时记录 score_cap_applied 与原因。
+    """
+    if not probe_record:
+        return audit_item
+    grade = probe_record.get("evidence_grade")
+    cap = _GAP_CAPS.get(grade)
+    if cap is None:
+        return audit_item
+
+    scores = audit_item.get("scores", {})
+    gap = float(scores.get("experience_gap", 0) or 0)
+    if gap <= cap:
+        return audit_item
+
+    scores["experience_gap"] = round(cap, 1)
+    scores["overall"] = _compute_overall(scores)
+    audit_item["scores"] = scores
+    audit_item["score_cap_applied"] = True
+    audit_item["score_cap_reason"] = (
+        f"证据等级 {grade}，experience_gap 由 {gap:.1f} 降至 {cap:.1f}")
+    return audit_item
+
+
+def _compute_overall(scores: dict) -> float:
+    """按固定权重计算综合得分，四舍五入到一位小数。不读取模型自报 overall。"""
+    demand = float(scores.get("demand", 0))
+    gap = float(scores.get("experience_gap", 0))
+    native = float(scores.get("native_advantage", 0))
+    feasibility = float(scores.get("indie_feasibility", 0))
+    return round(demand * 0.25 + gap * 0.30 + native * 0.25 + feasibility * 0.20, 1)
 
 
 def _normalize_audit_result(bm: dict, probe_record: dict | None, raw: object) -> dict | None:
@@ -225,20 +360,30 @@ def _normalize_audit_result(bm: dict, probe_record: dict | None, raw: object) ->
     if not isinstance(scores_raw, dict):
         return None
 
-    try:
-        demand = float(scores_raw.get("demand", 0))
-        gap = float(scores_raw.get("experience_gap", 0))
-        native = float(scores_raw.get("native_advantage", 0))
-        feasibility = float(scores_raw.get("indie_feasibility", 0))
-    except (ValueError, TypeError):
+    dimensions = _parse_dimensions(scores_raw)
+    if dimensions is None:
         return None
+    demand, gap, native, feasibility = dimensions
 
-    computed = demand * 0.25 + gap * 0.30 + native * 0.25 + feasibility * 0.20
-    overall_raw = scores_raw.get("overall")
-    try:
-        overall = float(overall_raw) if overall_raw is not None else computed
-    except (ValueError, TypeError):
-        overall = computed
+    # overall 永远由代码按固定权重计算，模型自报值只作诊断
+    computed = _compute_overall({
+        "demand": demand,
+        "experience_gap": gap,
+        "native_advantage": native,
+        "indie_feasibility": feasibility,
+    })
+    overall = computed
+
+    model_overall = None
+    overall_consistent = None
+    model_overall_raw = scores_raw.get("overall")
+    if model_overall_raw is not None:
+        try:
+            model_overall = float(model_overall_raw)
+        except (ValueError, TypeError):
+            model_overall = None
+    if model_overall is not None:
+        overall_consistent = (round(model_overall, 1) == round(computed, 1))
 
     verdict = raw.get("verdict", "")
     native_features = raw.get("native_features", [])
@@ -260,7 +405,7 @@ def _normalize_audit_result(bm: dict, probe_record: dict | None, raw: object) ->
                 "pain_summary": bad_refined,
             })
 
-    return {
+    result = {
         "benchmark_name": bm.get("name", ""),
         "apple_id": bm.get("apple_id", ""),
         "artist": bm.get("artist", ""),
@@ -279,7 +424,13 @@ def _normalize_audit_result(bm: dict, probe_record: dict | None, raw: object) ->
         "native_features": native_features if isinstance(native_features, list) else [],
         "attack_vector": attack_vector,
         "indie_advice": indie_advice,
+        "model_overall": model_overall,
+        "overall_consistent": overall_consistent,
+        "probe_status": probe_record.get("probe_status", "") if probe_record else "",
+        "evidence_grade": probe_record.get("evidence_grade", "") if probe_record else "",
     }
+    result = _apply_evidence_caps(result, probe_record)
+    return result
 
 
 def _summarize_pain(bad_reviews: list) -> list:
@@ -291,6 +442,52 @@ def _summarize_pain(bad_reviews: list) -> list:
         if content:
             pains.append(f"[{rating}星] {content[:100]}")
     return pains
+
+
+_REVIEW_STATUSES = ("request_error", "llm_filter_failed",
+                    "weak_evidence", "no_search_results", "partial")
+
+
+def _build_review_queue(audits: list[dict], probes: list[dict],
+                        min_score: float = 6.0) -> list[dict]:
+    """生成人工复核队列：请求错误、LLM 过滤失败、低证据、低 JTBD 置信度与临界项。
+
+    确认 A 级且达标的机会默认不入队。
+    """
+    probe_by_id = {}
+    for p in probes or []:
+        if p.get("apple_id"):
+            probe_by_id[p["apple_id"]] = p
+        if p.get("name"):
+            probe_by_id.setdefault(p["name"], p)
+
+    queue = []
+    for item in audits:
+        reasons = []
+        apple_id = item.get("apple_id", "")
+        name = item.get("benchmark_name", "")
+        pr = probe_by_id.get(apple_id) or probe_by_id.get(name) or {}
+        status = pr.get("probe_status", item.get("probe_status", ""))
+        grade = pr.get("evidence_grade", item.get("evidence_grade", ""))
+        overall = float(item.get("scores", {}).get("overall", 0) or 0)
+
+        if status in _REVIEW_STATUSES:
+            reasons.append(status)
+        if grade in ("C", "D"):
+            reasons.append(f"evidence_grade_{grade}")
+        if abs(overall - min_score) <= 0.5:
+            reasons.append("near_threshold")
+
+        if reasons:
+            queue.append({
+                "benchmark_name": name,
+                "apple_id": apple_id,
+                "reason_codes": reasons,
+                "evidence_grade": grade,
+                "probe_status": status,
+                "review_questions": ["是否需要补充关键词或人工确认？"],
+            })
+    return queue
 
 
 def _render_markdown_report(opp_data: dict, cfg: dict) -> str:

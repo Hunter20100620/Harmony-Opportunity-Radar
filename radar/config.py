@@ -27,11 +27,14 @@ DEFAULTS = {
         "charts": ["top-free", "top-paid"],
         "feed_limit": 100,
         "max_benchmarks": 20,
+        "llm_input_limit": 200,
     },
     "probe": {
         "max_comments_per_app": 50,
         "bad_rating_threshold": 3,
         "max_competitors": 3,
+        "max_keywords_per_benchmark": 4,
+        "comment_pages": 4,
         "filter_candidates_limit": 8,
         "enable_llm_filter": True,
     },
@@ -100,11 +103,14 @@ def validate_config(cfg: dict) -> list[str]:
         errors.append("捕获配置：至少选择一个榜单。")
     errors += _check_number_range("捕获配置：RSS 榜单条数", cap.get("feed_limit"), 1, 200)
     errors += _check_number_range("捕获配置：精选标杆上限", cap.get("max_benchmarks"), 1, 100)
+    errors += _check_number_range("捕获配置：LLM 输入上限", cap.get("llm_input_limit"), 1, 500)
 
     prb = cfg.get("probe") or {}
     errors += _check_number_range("探测配置：单应用评价上限", prb.get("max_comments_per_app"), 1, 500)
     errors += _check_number_range("探测配置：差评星级阈值", prb.get("bad_rating_threshold"), 1, 5)
     errors += _check_number_range("探测配置：单标杆最大竞品数", prb.get("max_competitors"), 1, 20)
+    errors += _check_number_range("探测配置：单标杆最大关键词数", prb.get("max_keywords_per_benchmark"), 1, 8)
+    errors += _check_number_range("探测配置：评论抓取页数", prb.get("comment_pages"), 1, 20)
     errors += _check_number_range("探测配置：LLM 候选过滤上限", prb.get("filter_candidates_limit"), 1, 50)
 
     audit = cfg.get("audit") or {}

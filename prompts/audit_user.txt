@@ -7,6 +7,11 @@ JTBD（用户底层任务）: {jtbd}
 入选理由: {pick_reason}
 
 --- 鸿蒙市场供给现状 ---
+探测状态: {probe_status}
+证据等级: {evidence_grade}
+空白置信度: {blank_confidence}
+检索统计(请求/成功/失败/非空): {query_stats}
+检索错误: {search_errors}
 是否生态空白: {is_blank}
 竞品数量: {competitor_count}
 {competitor_details}

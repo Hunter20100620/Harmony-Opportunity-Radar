@@ -37,6 +37,9 @@ def run(cfg: dict | None = None) -> int:
     bad_threshold = probe_cfg.get("bad_rating_threshold", 3)
     filter_limit = probe_cfg.get("filter_candidates_limit", 8)
     enable_llm_filter = probe_cfg.get("enable_llm_filter", True)
+    max_keywords = probe_cfg.get("max_keywords_per_benchmark", 4)
+    max_competitors = probe_cfg.get("max_competitors", 3)
+    comment_pages = probe_cfg.get("comment_pages", 4)
 
     benchmarks_list = benchmarks.get("benchmarks", [])
     total = len(benchmarks_list)
@@ -52,16 +55,22 @@ def run(cfg: dict | None = None) -> int:
     try:
         for idx, bm in enumerate(benchmarks_list, 1):
             name = bm.get("name", "?")
-            keywords = bm.get("search_keywords", [])[:2]
+            keywords, skipped = _select_keywords(
+                bm.get("search_keywords", []), max_keywords)
             print(f"\n[{idx}/{total}] {name}")
-            print(f"          关键词: {keywords}")
+            print(f"          关键词: {keywords}"
+                  + (f"（跳过 {len(skipped)} 个）" if skipped else ""))
             telemetry.progress(STAGE, idx - 1, current=name)
 
             try:
                 record = _probe_one_benchmark(
                     client, llm, bm, keywords,
                     max_comments, bad_threshold, filter_limit,
+                    max_competitors=max_competitors,
+                    comment_pages=comment_pages,
                 )
+                record["keywords_available"] = len(bm.get("search_keywords", []))
+                record["keywords_skipped"] = skipped
                 results.append(record)
                 status = f"{len(record['competitors'])} 个竞品"
                 if record.get("blank_signal"):
@@ -70,15 +79,10 @@ def run(cfg: dict | None = None) -> int:
                 telemetry.progress(STAGE, idx, current=name, message=status)
             except (AppGalleryError, RuntimeError) as e:
                 print(f"          [warn] 探测失败: {e}")
-                results.append({
-                    "name": name,
-                    "apple_id": bm.get("apple_id", ""),
-                    "keywords_used": list(keywords),
-                    "competitor_count": 0,
-                    "competitors": [],
-                    "blank_signal": True,
-                    "error": str(e),
-                })
+                results.append(_make_record(
+                    name, bm.get("apple_id", ""), list(keywords),
+                    probe_status="request_error", blank_signal=False,
+                    search_errors=[{"keyword": "", "error": str(e)}]))
                 telemetry.progress(STAGE, idx, current=name, message=f"失败: {e}")
     finally:
         client.close()
@@ -129,6 +133,95 @@ def _download_rank(dls_str: str) -> int:
         return 0
 
 
+# probe 状态机：区分「确认有竞品 / 确认空白 / 无搜索结果 / 请求失败 /
+# LLM 过滤失败 / 证据薄弱 / 部分成功」。只有 confirmed_empty 才是真正的生态空白。
+PROBE_STATUSES = (
+    "confirmed_competitors",
+    "confirmed_empty",
+    "no_search_results",
+    "request_error",
+    "llm_filter_failed",
+    "weak_evidence",
+    "partial",
+)
+
+
+def _empty_query_stats() -> dict:
+    return {"requested": 0, "succeeded": 0, "failed": 0, "non_empty": 0}
+
+
+def _derive_evidence_grade(record: dict) -> str:
+    """仅依据结构化探测事实推导证据等级 A/B/C/D。
+
+    不读取任何 LLM 分数，避免用打分结果反推证据质量。
+      A: 多关键词成功 + 有竞品且评论证据充分
+      B: 检索成功 + 有竞品但评论/详情不完整
+      C: 检索成功但无确认竞品或覆盖有限
+      D: 请求错误 / LLM 过滤失败 / 证据不可用
+    """
+    status = record.get("probe_status", "")
+    stats = record.get("query_stats", {}) or {}
+    competitors = record.get("competitors", []) or []
+
+    if status in ("request_error", "llm_filter_failed"):
+        return "D"
+    if status in ("no_search_results", "confirmed_empty"):
+        return "C"
+
+    if not competitors:
+        return "C"
+
+    succeeded = int(stats.get("succeeded", 0) or 0)
+    requested = int(stats.get("requested", 0) or 0)
+    multi_keyword = requested > 1 and succeeded == requested
+    sufficient_reviews = all(
+        (c.get("review_evidence") in ("sufficient",)) for c in competitors)
+
+    if multi_keyword and sufficient_reviews:
+        return "A"
+    return "B"
+
+
+def _make_record(name: str, apple_id: str, keywords: list[str], *,
+                 probe_status: str, blank_signal: bool = False,
+                 competitors: list | None = None,
+                 query_stats: dict | None = None,
+                 search_errors: list | None = None,
+                 **extra) -> dict:
+    """构造统一的 probe 记录，保证状态字段齐全。"""
+    record = {
+        "name": name,
+        "apple_id": apple_id,
+        "keywords_used": list(keywords),
+        "probe_status": probe_status,
+        "competitor_count": len(competitors or []),
+        "competitors": competitors or [],
+        "blank_signal": blank_signal,
+        "query_stats": query_stats or _empty_query_stats(),
+        "search_errors": search_errors or [],
+    }
+    record.update(extra)
+    record["evidence_grade"] = _derive_evidence_grade(record)
+    if blank_signal:
+        record["blank_confidence"] = "high"
+    else:
+        record["blank_confidence"] = "none"
+    return record
+
+
+def _select_keywords(raw_keywords: list, limit: int) -> tuple[list[str], list[str]]:
+    """去重非空关键词并保留顺序，返回（选用, 跳过）两个列表。"""
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for kw in raw_keywords or []:
+        kw = str(kw).strip()
+        if not kw or kw in seen:
+            continue
+        seen.add(kw)
+        normalized.append(kw)
+    return normalized[:limit], normalized[limit:]
+
+
 def _probe_one_benchmark(
     client: AppGalleryClient,
     llm: LLMClient | None,
@@ -137,26 +230,50 @@ def _probe_one_benchmark(
     max_comments: int,
     bad_threshold: int,
     filter_limit: int,
+    max_competitors: int = 3,
+    comment_pages: int = 4,
 ) -> dict:
-    """探测单个标杆的鸿蒙市场竞品。"""
+    """探测单个标杆的鸿蒙市场竞品，返回带明确状态的可追溯记录。"""
     name = bm.get("name", "")
     apple_id = bm.get("apple_id", "")
     jtbd = bm.get("jtbd", "")
 
     # 第 1 步：关键词检索 + 包名去重（规则过滤已在 search 内完成）
+    query_stats = _empty_query_stats()
+    search_errors: list[dict] = []
     seen_pkg: dict[str, dict] = {}
     for kw in keywords:
         if not kw:
             continue
-        apps = client.search(kw, max_results=25)
+        query_stats["requested"] += 1
+        try:
+            apps = client.search(kw, max_results=25)
+        except AppGalleryError as e:
+            query_stats["failed"] += 1
+            search_errors.append({"keyword": kw, "error": str(e)})
+            continue
+        query_stats["succeeded"] += 1
+        if apps:
+            query_stats["non_empty"] += 1
         for app in apps:
             pkg = app.get("package", "")
             if not pkg or pkg in seen_pkg:
                 continue
             seen_pkg[pkg] = app
 
+    # 全部请求失败 → 请求错误，绝非生态空白
+    if query_stats["succeeded"] == 0:
+        return _make_record(
+            name, apple_id, keywords, probe_status="request_error",
+            blank_signal=False, query_stats=query_stats,
+            search_errors=search_errors)
+
+    # 检索成功但无任何候选 → 无搜索结果，需人工确认后才可能为空白
     if not seen_pkg:
-        return _blank_record(name, apple_id, keywords, jtbd)
+        return _make_record(
+            name, apple_id, keywords, probe_status="no_search_results",
+            blank_signal=False, query_stats=query_stats,
+            search_errors=search_errors)
 
     # 第 2 步：按下载量/评分排序，截取候选池
     sorted_candidates = sorted(
@@ -166,27 +283,44 @@ def _probe_one_benchmark(
     )
     candidates = sorted_candidates[:filter_limit]
 
-    # 第 3 步：LLM 语义相关度判定
+    # 第 3 步：LLM 语义相关度判定（返回结构化状态）
+    filter_status = "disabled"
+    approved_packages: list[str] = []
+    filter_error = None
     if llm:
-        try:
-            approved_packages = _llm_filter_competitors(llm, name, jtbd, candidates)
-        except LLMError as e:
-            print(f"          [warn] LLM 过滤失败({e})，回退到规则排序")
-            approved_packages = None
-    else:
-        approved_packages = None
+        filt = _llm_filter_competitors(llm, name, jtbd, candidates,
+                                       max_competitors=max_competitors)
+        filter_status = filt.get("status", "invalid_response")
+        approved_packages = filt.get("packages", []) or []
+        filter_error = filt.get("error")
 
-    # approved_packages=None 表示 LLM 不可用/回退，使用规则排序的前 3 个
-    if approved_packages is not None:
+    if filter_status == "confirmed_empty":
+        return _make_record(
+            name, apple_id, keywords, probe_status="confirmed_empty",
+            blank_signal=True, query_stats=query_stats,
+            search_errors=search_errors,
+            candidate_pool_size=len(seen_pkg), candidates_considered=len(candidates),
+            llm_verdict="LLM判定无同等同类竞品", llm_filter_status=filter_status)
+
+    if filter_status in ("invalid_response", "request_error"):
+        return _make_record(
+            name, apple_id, keywords, probe_status="llm_filter_failed",
+            blank_signal=False, query_stats=query_stats,
+            search_errors=search_errors,
+            candidate_pool_size=len(seen_pkg), candidates_considered=len(candidates),
+            unverified_candidates=[
+                {"name": a.get("name", ""), "package": a.get("package", "")}
+                for a in candidates
+            ],
+            filter_error=filter_error, llm_filter_status=filter_status)
+
+    # confirmed（LLM 认可）或 disabled（LLM 关闭，回退规则排序）
+    if filter_status == "confirmed":
         top = [a for a in candidates if a.get("package", "") in approved_packages]
-        if not top:
-            # LLM 明确判定无同类 → 生态空白
-            return {**_blank_record(name, apple_id, keywords, jtbd),
-                    "llm_verdict": "LLM判定无同等同类竞品"}
-        blank_signal_from_llm = False
     else:
         top = candidates[:3]
-        blank_signal_from_llm = False
+    # 代码层硬上限：最终竞品数绝不超过配置值
+    top = top[:max_competitors]
 
     # 第 4 步：对被认可的竞品抓取详情和评论
     competitors = []
@@ -202,20 +336,13 @@ def _probe_one_benchmark(
         except AppGalleryError:
             pass
 
-        bad_reviews = []
-        all_reviews = []
-        try:
-            cmt = client.comments(appid, page_num=1, page_size=25)
-            all_reviews = cmt.get("list", [])
-            if len(all_reviews) >= 25 and len(all_reviews) < max_comments:
-                cmt2 = client.comments(appid, page_num=2, page_size=25)
-                all_reviews.extend(cmt2.get("list", []))
-            bad_reviews = [
-                r for r in all_reviews
-                if r.get("rating", 0) is not None and _safe_rating(r["rating"]) <= bad_threshold
-            ][:max_comments]
-        except AppGalleryError:
-            pass
+        all_reviews, comment_status = _collect_comments(
+            client, appid, comment_pages, max_comments)
+        comment_stats = _comment_stats(all_reviews)
+        bad_reviews = [
+            r for r in all_reviews
+            if r.get("rating", 0) is not None and _safe_rating(r["rating"]) <= bad_threshold
+        ][:max_comments]
 
         competitor = {
             "name": app.get("name", ""),
@@ -230,6 +357,9 @@ def _probe_one_benchmark(
             "comment_count": len(all_reviews),
             "bad_review_count": len(bad_reviews),
             "bad_reviews": bad_reviews,
+            "comment_stats": comment_stats,
+            "review_evidence": comment_status,
+            "rating_distribution": comment_stats["rating_distribution"],
         }
         competitors.append(competitor)
 
@@ -238,13 +368,70 @@ def _probe_one_benchmark(
         for c in competitors
     )
 
+    status = "confirmed_competitors" if has_meaningful else "weak_evidence"
+    return _make_record(
+        name, apple_id, keywords, probe_status=status,
+        blank_signal=False, competitors=competitors,
+        query_stats=query_stats, search_errors=search_errors,
+        candidate_pool_size=len(seen_pkg), candidates_considered=len(candidates),
+        llm_filter_status=filter_status)
+
+
+def _collect_comments(client, appid: str, comment_pages: int,
+                      max_comments: int) -> tuple[list[dict], str]:
+    """分页抓取评论，返回（扁平评论列表, review_evidence 状态）。
+
+    review_evidence 取值：sufficient / insufficient / request_error / missing。
+    评论请求失败与「零差评」是两回事，必须区分。
+    """
+    all_reviews: list[dict] = []
+    request_failed = False
+    for page in range(1, max(1, comment_pages) + 1):
+        try:
+            cmt = client.comments(appid, page_num=page, page_size=25)
+        except AppGalleryError:
+            request_failed = True
+            break
+        page_list = cmt.get("list", []) or []
+        if not page_list:
+            break
+        all_reviews.extend(page_list)
+        if len(all_reviews) >= max_comments:
+            break
+    all_reviews = all_reviews[:max_comments]
+
+    if request_failed:
+        return all_reviews, "request_error"
+    if not all_reviews:
+        return all_reviews, "missing"
+    valid = sum(1 for r in all_reviews
+                if r.get("rating") is not None and _safe_rating(r["rating"]) != 99)
+    if valid >= 3:
+        return all_reviews, "sufficient"
+    return all_reviews, "insufficient"
+
+
+def _comment_stats(reviews: list[dict]) -> dict:
+    """计算评论样本统计：抓取量、有效评分、差评数与评分分布。"""
+    valid = 0
+    bad = 0
+    dist: dict[str, int] = {}
+    for r in reviews:
+        rating = r.get("rating")
+        if rating is None or _safe_rating(rating) == 99:
+            continue
+        valid += 1
+        v = int(_safe_rating(rating))
+        if v <= 3:
+            bad += 1
+        key = str(v)
+        dist[key] = dist.get(key, 0) + 1
     return {
-        "name": name,
-        "apple_id": apple_id,
-        "keywords_used": list(keywords),
-        "competitor_count": len(competitors),
-        "competitors": competitors,
-        "blank_signal": blank_signal_from_llm or not has_meaningful,
+        "fetched": len(reviews),
+        "valid_rating": valid,
+        "bad_rating": bad,
+        "bad_ratio": round(bad / valid, 3) if valid else 0.0,
+        "rating_distribution": dist,
     }
 
 
@@ -253,9 +440,17 @@ def _llm_filter_competitors(
     benchmark_name: str,
     benchmark_jtbd: str,
     candidates: list[dict],
-) -> list[str]:
-    """调用 LLM 从候选应用中筛选出真正的同类竞品。"""
-    # 精简候选信息，控制上下文
+    max_competitors: int = 3,
+) -> dict:
+    """调用 LLM 从候选应用中筛选出真正的同类竞品，返回结构化状态。
+
+    返回 {"status", "packages", "error"}，status 取值：
+      confirmed        有确认的同类竞品
+      confirmed_empty  LLM 明确返回合法空数组（无同类）
+      invalid_response 格式异常或返回了列表外的包名
+      request_error    LLM 调用失败
+    """
+    candidate_packages = {a.get("package", "") for a in candidates}
     slim = [
         {"name": a.get("name", ""), "category": a.get("category", ""),
          "package": a.get("package", ""), "intro": a.get("intro", "")[:80]}
@@ -266,27 +461,36 @@ def _llm_filter_competitors(
         benchmark_name=benchmark_name,
         benchmark_jtbd=benchmark_jtbd,
         candidates_json=candidates_json,
+        max_competitors=max_competitors,
     )
-    result = llm.chat_json(PROBE_FILTER_SYSTEM, prompt, temperature=0.1,
-                           stage=STAGE, target=benchmark_name)
+    try:
+        result = llm.chat_json(PROBE_FILTER_SYSTEM, prompt, temperature=0.1,
+                               stage=STAGE, target=benchmark_name)
+    except LLMError as e:
+        return {"status": "request_error", "packages": [], "error": str(e)}
+
+    raw_list = None
     if isinstance(result, list):
-        return [str(pkg) for pkg in result]
-    if isinstance(result, dict):
-        # 部分模型可能套一层对象
+        raw_list = result
+    elif isinstance(result, dict):
         for v in result.values():
             if isinstance(v, list):
-                return [str(pkg) for pkg in v]
-    print(f"          [warn] LLM 返回格式异常({type(result).__name__})，回退")
-    return []
+                raw_list = v
+                break
 
+    # 结构非法（非数组、缺数组）→ 格式失败，绝不能当作确认空白
+    if raw_list is None:
+        return {"status": "invalid_response", "packages": [],
+                "error": f"LLM 返回非数组结构: {type(result).__name__}"}
 
-def _blank_record(name: str, apple_id: str, keywords: list[str],
-                  jtbd: str = "") -> dict:
-    return {
-        "name": name,
-        "apple_id": apple_id,
-        "keywords_used": list(keywords),
-        "competitor_count": 0,
-        "competitors": [],
-        "blank_signal": True,
-    }
+    # 合法空数组 → 确认无同类
+    if len(raw_list) == 0:
+        return {"status": "confirmed_empty", "packages": [], "error": None}
+
+    # 白名单：只接受候选列表内原样出现的包名
+    valid = [str(p) for p in raw_list if str(p) in candidate_packages]
+    if not valid:
+        return {"status": "invalid_response", "packages": [],
+                "error": "LLM 返回的包名均不在候选列表内"}
+
+    return {"status": "confirmed", "packages": valid, "error": None}
