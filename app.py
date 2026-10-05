@@ -1304,6 +1304,7 @@ def _config_from_form(form):
             "charts": form["charts"],
             "feed_limit": int(form["feed_limit"]),
             "max_benchmarks": int(form["max_benchmarks"]),
+            "llm_input_limit": int(form["llm_input_limit"]),
         },
         "probe": {
             "max_comments_per_app": int(form["max_comments_per_app"]),
@@ -1344,6 +1345,8 @@ def _render_config_form(cfg):
                                      value=int(cap.get("feed_limit", 100)), step=10)
         max_benchmarks = st.number_input("精选标杆上限", min_value=1, max_value=100,
                                          value=int(cap.get("max_benchmarks", 20)), step=1)
+        llm_input_limit = st.number_input("LLM 输入上限", min_value=1, max_value=500,
+                                          value=int(cap.get("llm_input_limit", 200)), step=10)
 
         st.markdown("---")
         st.markdown("**华为探测配置**")
@@ -1377,7 +1380,8 @@ def _render_config_form(cfg):
         new_cfg = _config_from_form({
             "base_url": base_url, "api_key": api_key, "model": model, "timeout": timeout,
             "regions": regions, "charts": charts, "feed_limit": feed_limit,
-            "max_benchmarks": max_benchmarks, "max_comments_per_app": max_comments_per_app,
+            "max_benchmarks": max_benchmarks, "llm_input_limit": llm_input_limit,
+            "max_comments_per_app": max_comments_per_app,
             "bad_rating_threshold": bad_rating_threshold, "max_competitors": max_competitors,
             "max_keywords_per_benchmark": max_keywords_per_benchmark,
             "comment_pages": comment_pages,
