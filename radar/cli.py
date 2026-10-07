@@ -13,7 +13,13 @@ import sys
 
 from radar import store
 from radar.config import load_config
-from radar.pipeline import PipelineAbortError
+from radar.pipeline import (
+    EXIT_ABORT,
+    EXIT_OK,
+    EXIT_RETRYABLE,
+    PipelineAbortError,
+    RetryableAbortError,
+)
 
 # 命令 → (阶段名, 中文标签, 下一步提示)
 COMMANDS = {
@@ -69,14 +75,19 @@ def _run_stage(stage: str, label: str, cfg: dict, batch_id: str | None,
         else:
             from radar.pipeline import audit
             n = audit.run(cfg)
+    except RetryableAbortError as e:
+        # 可重试中断：网络/LLM 临时故障，WebUI 会据此自动重试或等待继续
+        batch.finish("interrupted", summary="可重试中断", error=str(e))
+        print(f"\n[中断] {e}", file=sys.stderr)
+        return -EXIT_RETRYABLE
     except PipelineAbortError as e:
         batch.finish("failed", summary="熔断中止", error=str(e))
         print(f"\n[熔断] {e}", file=sys.stderr)
-        return -1
+        return -EXIT_ABORT
     except Exception as e:  # 其他异常同样标记批次失败，保留历史
         batch.finish("failed", summary="执行异常", error=f"{type(e).__name__}: {e}")
         print(f"\n[失败] {type(e).__name__}: {e}", file=sys.stderr)
-        return -1
+        return -EXIT_ABORT
 
     summary = f"{label}完成: {n}"
     batch.finish("success", summary=summary)
@@ -91,7 +102,7 @@ def main(argv=None):
     if args.command == "gui":
         print("启动 Streamlit GUI...")
         subprocess.run([sys.executable, "-m", "streamlit", "run", "app.py"])
-        return 0
+        return EXIT_OK
 
     cfg = load_config()
     stage, label, next_hint = COMMANDS[args.command]
@@ -99,7 +110,8 @@ def main(argv=None):
     n = _run_stage(stage, label, cfg, args.batch_id, args.base_run_id,
                    emit_events=args.emit_events)
     if n < 0:
-        return 1
+        # 负数编码失败性质：-1 致命熔断，-2 可重试中断 → 转成正退出码
+        return abs(n)
 
     if stage == "capture":
         print(f"\n=== capture 完成: {n} 个标杆 ===\n{next_hint}")
@@ -109,7 +121,7 @@ def main(argv=None):
         print(f"\n=== audit 完成: {n} 个高潜机会入选 ===")
         print("机会清单: data/opportunities.json")
         print("决策看板: data/report.md")
-    return 0
+    return EXIT_OK
 
 
 if __name__ == "__main__":

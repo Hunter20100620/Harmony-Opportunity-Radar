@@ -24,6 +24,7 @@ import streamlit as st
 
 from radar import prompts, store, telemetry
 from radar.config import DEFAULTS, PROJECT_ROOT, load_config, save_config, validate_config
+from radar.pipeline import EXIT_RETRYABLE
 from radar.store import DATA_DIR, RUNS_DIR
 
 # Windows asyncio ProactorEventLoop 的已知噪音：对端强制断开（如关闭/刷新
@@ -114,6 +115,8 @@ section[data-testid="stSidebar"]{ background:var(--bg-1) !important; border-righ
 .status.done .dot{ background:var(--ok); }
 .status.failed{ color:var(--danger); border-color:rgba(255,138,128,.45); background:rgba(255,138,128,.08); }
 .status.failed .dot{ background:var(--danger); }
+.status.interrupted{ color:var(--amber); border-color:rgba(233,165,104,.45); background:rgba(233,165,104,.08); }
+.status.interrupted .dot{ background:var(--amber); }
 @keyframes pulse{ 0%,100%{opacity:1} 50%{opacity:.3} }
 @media (prefers-reduced-motion:reduce){ *{ animation:none !important; transition:none !important; } }
 
@@ -344,6 +347,10 @@ PIPELINE_STEPS = {
     "audit": [("四维审计", ["audit"])],
 }
 
+# 步骤级可重试中断的自动重试次数与退避基数（秒）
+STEP_RETRY_ATTEMPTS = 2
+STEP_RETRY_BASE_WAIT = 3.0
+
 # 历史批次下拉的「当前/最新」哨兵值
 LATEST_SENTINEL = "__latest__"
 
@@ -353,7 +360,8 @@ def _init_session():
     st.session_state.setdefault(
         RUN_KEY,
         {"status": "idle", "label": "", "cmd": "", "start": None, "end": None,
-         "returncode": None, "error": None, "batch_id": None, "steps": []},
+         "returncode": None, "error": None, "batch_id": None, "key": None,
+         "steps": [], "failed_step": None},
     )
     st.session_state.setdefault(QUEUE_KEY, None)
     st.session_state.setdefault(TRACES_KEY, [])
@@ -381,76 +389,120 @@ def _append_trace(trace: dict):
 # --------------------------------------------------------------------------
 # 后台执行（线程安全：只写 queue，不碰 st.*）
 # --------------------------------------------------------------------------
-def _worker(q: "queue.Queue", label: str, steps: list):
+def _run_step(q: "queue.Queue", prefix: str, args: list, batch_id: str | None):
+    """执行单个阶段子进程，返回 (returncode, batch_id)。
+
+    子进程 stdout 的遥测事件实时投递到 queue；批次号在首次出现时捕获。
+    """
+    cmd_args = list(args) + ["--emit-events"]
+    if batch_id:
+        cmd_args += ["--batch-id", batch_id]
+    q.put(("log", f"▶ {prefix}  (python -m radar {' '.join(cmd_args)})"))
+    step_started = time.time()
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "radar", *cmd_args],
+            cwd=str(PROJECT_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+    except Exception as exc:  # 启动失败：解释器缺失 / 环境异常
+        q.put(("error", f"命令执行失败，请检查环境: {exc}"))
+        return None, batch_id
+    try:
+        for line in iter(proc.stdout.readline, ""):
+            if not line:
+                continue
+            event = telemetry.parse_event_line(line)
+            if event is None:
+                q.put(("log", line.rstrip()))
+                continue
+            # 捕获首个阶段的批次号，供后续阶段复用同一批次目录
+            if batch_id is None and event.get("batch_id"):
+                batch_id = event["batch_id"]
+            q.put(("event", event))
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+    # 读到 stdout EOF 后 returncode 仍可能是 None（进程尚未回收），
+    # 必须显式 wait() 拿真实退出码；否则 None != 0 会把成功误判为失败。
+    try:
+        returncode = proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        returncode = proc.wait()
+    except Exception:
+        returncode = proc.poll()
+    elapsed = time.time() - step_started
+    if returncode is None:
+        q.put(("error", f"{prefix} 未能获取退出码，进程可能异常退出。"))
+        return None, batch_id
+    q.put(("log", f"■ {prefix} 结束（退出码 {returncode}，耗时 {elapsed:.1f}s）"))
+    return returncode, batch_id
+
+
+def _worker(q: "queue.Queue", label: str, steps: list, offset: int = 0,
+            batch_id: str | None = None):
     """后台线程：串行执行各阶段子进程，解析其 stdout 遥测事件并投递到 queue。
 
     事件协议（见 radar/telemetry.py）: 行首 `__RADAR_EVENT__:{json}` 为结构化事件，
     其余行为普通日志。全量扫描时各阶段共享同一个 batch_id，产物归档到同一批次。
+
+    offset 为续跑时的全局步骤起点（用于显示「步骤 2/3」）；batch_id 续跑时复用。
+
+    失败语义：
+    - 退出码 2（可重试中断）自动重试 STEP_RETRY_ATTEMPTS 次，仍失败则进入
+      「中断」态并上报失败步骤索引，等待用户在 WebUI 修好配置后一键继续。
+    - 其他非零退出码为致命熔断，直接中止。
     """
-    total = len(steps)
-    batch_id = None  # 首个阶段生成，后续阶段复用
-    for i, (step_label, args) in enumerate(steps, 1):
+    total = offset + len(steps)
+    for i, (step_label, args) in enumerate(steps, offset + 1):
         prefix = f"步骤 {i}/{total} · {step_label}" if total > 1 else step_label
-        cmd_args = list(args) + ["--emit-events"]
-        if batch_id:
-            cmd_args += ["--batch-id", batch_id]
-        q.put(("log", f"▶ {prefix}  (python -m radar {' '.join(cmd_args)})"))
-        step_started = time.time()
-        try:
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "radar", *cmd_args],
-                cwd=str(PROJECT_ROOT),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-            )
-        except Exception as exc:  # 启动失败：解释器缺失 / 环境异常
-            q.put(("error", f"命令执行失败，请检查环境: {exc}"))
-            q.put(("done", -1))
-            return
-        try:
-            for line in iter(proc.stdout.readline, ""):
-                if not line:
-                    continue
-                event = telemetry.parse_event_line(line)
-                if event is None:
-                    q.put(("log", line.rstrip()))
-                    continue
-                # 捕获首个阶段的批次号，供后续阶段复用同一批次目录
-                if batch_id is None and event.get("batch_id"):
-                    batch_id = event["batch_id"]
-                q.put(("event", event))
-        finally:
-            try:
-                proc.stdout.close()
-            except Exception:
-                pass
-        # 读到 stdout EOF 后 returncode 仍可能是 None（进程尚未回收），
-        # 必须显式 wait() 拿真实退出码；否则 None != 0 会把成功误判为失败。
-        try:
-            returncode = proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            returncode = proc.wait()
-        except Exception:
-            returncode = proc.poll()
-        elapsed = time.time() - step_started
-        if returncode is None:
-            q.put(("error", f"{step_label} 未能获取退出码，进程可能异常退出。"))
-            q.put(("done", -1))
-            return
-        q.put(("log", f"■ {prefix} 结束（退出码 {returncode}，耗时 {elapsed:.1f}s）"))
-        if returncode != 0:
+        attempt = 0
+        while True:
+            attempt += 1
+            attempt_prefix = (f"{prefix}（第 {attempt} 次尝试）"
+                              if attempt > 1 else prefix)
+            returncode, batch_id = _run_step(q, attempt_prefix, args, batch_id)
+            if returncode is None:
+                q.put(("done", -1))
+                return
+            if returncode == 0:
+                break
+            # 可重试中断：退避后自动重试，仍失败则交回用户决定是否继续
+            if returncode == EXIT_RETRYABLE and attempt <= STEP_RETRY_ATTEMPTS:
+                wait = STEP_RETRY_BASE_WAIT * attempt
+                q.put(("log", f"↻ {step_label} 可重试中断，{wait:.0f}s 后自动重试"
+                              f"（{attempt}/{STEP_RETRY_ATTEMPTS}）…"))
+                time.sleep(wait)
+                continue
+            if returncode == EXIT_RETRYABLE:
+                q.put(("error", f"{step_label} 重试 {STEP_RETRY_ATTEMPTS} 次后仍中断，"
+                                f"已保留历史产物。修正配置后可点「继续」从该步恢复。"))
+                q.put(("interrupted", {"step_index": i - 1, "batch_id": batch_id,
+                                       "label": label}))
+                return
             q.put(("error", f"{step_label} 退出码 {returncode}，流程中止。"))
             q.put(("done", returncode))
             return
     q.put(("done", 0))
 
 
-def _start_run(label: str, key: str):
-    steps = PIPELINE_STEPS[key]
+def _start_run(label: str, key: str, resume_from: int = 0, batch_id: str | None = None,
+               all_steps: list | None = None):
+    """启动一次运行。
+
+    resume_from > 0 表示从失败步骤继续：只跑该步及其之后的步骤，
+    并复用原批次目录（batch_id），上游产物已在其中，无需重新继承。
+    all_steps 用于在续跑时保留完整步骤列表（进度显示为「步骤 2/3」而非「1/2」）。
+    """
+    full_steps = all_steps or PIPELINE_STEPS[key]
+    steps = full_steps[resume_from:]
     q: "queue.Queue" = queue.Queue()
     st.session_state[QUEUE_KEY] = q
     st.session_state[LOG_KEY] = []
@@ -460,16 +512,31 @@ def _start_run(label: str, key: str):
     st.session_state[RUN_KEY] = {
         "status": "running",
         "label": label,
-        "cmd": "python -m radar " + " ".join(a for _, args in steps for a in args),
+        "cmd": "python -m radar " + " ".join(a for _, args in full_steps for a in args),
         "start": time.time(),
         "end": None,
         "returncode": None,
         "error": None,
-        "batch_id": None,
-        "steps": [s[0] for s in steps],
+        "batch_id": batch_id,
+        "key": key,
+        "steps": [s[0] for s in full_steps],
+        "failed_step": None,
     }
-    _append_log(f"启动: {label}")
-    threading.Thread(target=_worker, args=(q, label, steps), daemon=True).start()
+    verb = f"继续: {label}（从步骤 {resume_from + 1}/{len(full_steps)}）" if resume_from else f"启动: {label}"
+    _append_log(verb)
+    threading.Thread(target=_worker, args=(q, label, steps, resume_from, batch_id),
+                     daemon=True).start()
+
+
+def _resume_run():
+    """从上次中断的步骤继续：复用原批次目录，只跑失败步骤及其后续。"""
+    state = st.session_state[RUN_KEY]
+    key = state.get("key")
+    failed_step = state.get("failed_step")
+    if not key or failed_step is None:
+        return
+    _start_run(state.get("label", "继续"), key, resume_from=failed_step,
+               batch_id=state.get("batch_id"), all_steps=PIPELINE_STEPS[key])
 
 
 def _handle_event(event: dict):
@@ -525,6 +592,13 @@ def _drain_queue():
         elif kind == "error":
             state["error"] = payload
             _append_log(f"✖ {payload}")
+        elif kind == "interrupted":
+            state["status"] = "interrupted"
+            state["end"] = time.time()
+            state["failed_step"] = payload.get("step_index", 0)
+            if payload.get("batch_id"):
+                state["batch_id"] = payload["batch_id"]
+            _append_log("已中断，等待修正配置后继续。")
         elif kind == "done":
             state["returncode"] = payload
             state["end"] = time.time()
@@ -534,7 +608,7 @@ def _drain_queue():
             else:
                 state["status"] = "failed"
                 _append_log(f"失败（返回码 {payload}）")
-    if state["status"] in ("done", "failed"):
+    if state["status"] in ("done", "failed", "interrupted"):
         st.session_state[QUEUE_KEY] = None
 
 
@@ -552,7 +626,8 @@ def _elapsed(state) -> str:
 
 def _status_html(state, live: bool = True) -> str:
     status = state.get("status", "idle")
-    label = {"idle": "空闲", "running": "运行中", "done": "已完成", "failed": "失败"}[status]
+    label = {"idle": "空闲", "running": "运行中", "done": "已完成",
+             "failed": "失败", "interrupted": "已中断"}.get(status, status)
     if status == "running":
         label = f"运行中 · {state.get('label', '')}"
     live_attr = ' role="status" aria-live="polite"' if live else ""
@@ -614,8 +689,8 @@ def _history_options() -> list[str]:
     opts = []
     for item in store.list_runs():
         meta = item.get("meta", {})
-        status = {"success": "成功", "failed": "失败", "running": "运行中"}.get(
-            meta.get("status"), "未知")
+        status = {"success": "成功", "failed": "失败", "running": "运行中",
+                  "interrupted": "中断"}.get(meta.get("status"), "未知")
         stage = meta.get("stage", "?")
         opts.append(f"{item['batch_id']} · {stage} · {status}")
     return opts
@@ -881,18 +956,37 @@ def _live_fragment():
     )
 
 
+def _render_resume_controls(state):
+    """中断态下的继续控件：显示失败步骤并提供「继续」按钮。"""
+    key = state.get("key")
+    failed_step = state.get("failed_step") or 0
+    steps = PIPELINE_STEPS.get(key, [])
+    step_label = steps[failed_step][0] if failed_step < len(steps) else "未知步骤"
+    st.markdown(
+        f'<div class="muted" style="margin-top:8px">'
+        f'将在同一批次 <b>{html.escape(str(state.get("batch_id") or "—"))}</b> 中'
+        f'从「{html.escape(step_label)}」重新执行。请先到「控制台」修正配置。'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+    if st.button("继续执行（从失败步骤恢复）", type="primary", use_container_width=False):
+        _resume_run()
+        st.rerun()
+
+
 def render_run_strip():
     state = st.session_state[RUN_KEY]
     if state["status"] == "running":
         _live_fragment()
         return
-    if state["status"] in ("done", "failed"):
+    if state["status"] in ("done", "failed", "interrupted"):
         prog = st.session_state[PROGRESS_KEY]
         traces = st.session_state[TRACES_KEY]
         batch_id = state.get("batch_id")
         badge = (f' · 批次 <b>{html.escape(str(batch_id))}</b>' if batch_id else "")
-        border = ("rgba(255,138,128,.45)" if state["status"] == "failed"
-                  else "var(--border-1)")
+        border = {"failed": "rgba(255,138,128,.45)",
+                  "interrupted": "rgba(233,165,104,.45)"}.get(
+                      state["status"], "var(--border-1)")
         err_html = ""
         if state.get("error"):
             err_html = (f'<div class="muted" style="color:var(--danger);margin-top:8px">'
@@ -907,6 +1001,8 @@ def render_run_strip():
             f'{_progress_html(prog)}{err_html}</div>',
             unsafe_allow_html=True,
         )
+        if state["status"] == "interrupted":
+            _render_resume_controls(state)
         if traces:
             with st.expander(f"LLM 调用追踪（{len(traces)} 次，点击展开详情）", expanded=False):
                 st.markdown("".join(_trace_card(t, i) for i, t in enumerate(traces)),
@@ -947,6 +1043,12 @@ def sidebar_panel(cfg):
     if st.sidebar.button("仅审计", disabled=disabled, use_container_width=True):
         _start_run("仅审计", "audit")
         st.rerun()
+
+    if st.session_state[RUN_KEY].get("status") == "interrupted":
+        if st.sidebar.button("继续上次中断的流程", type="primary",
+                             disabled=disabled, use_container_width=True, key="side_resume"):
+            _resume_run()
+            st.rerun()
 
     st.sidebar.markdown("---")
     logs = st.session_state[LOG_KEY]
@@ -1305,6 +1407,7 @@ def _config_from_form(form):
             "feed_limit": int(form["feed_limit"]),
             "max_benchmarks": int(form["max_benchmarks"]),
             "llm_input_limit": int(form["llm_input_limit"]),
+            "rss_retries": int(form["rss_retries"]),
         },
         "probe": {
             "max_comments_per_app": int(form["max_comments_per_app"]),
@@ -1347,6 +1450,8 @@ def _render_config_form(cfg):
                                          value=int(cap.get("max_benchmarks", 20)), step=1)
         llm_input_limit = st.number_input("LLM 输入上限", min_value=1, max_value=500,
                                           value=int(cap.get("llm_input_limit", 200)), step=10)
+        rss_retries = st.number_input("RSS 拉取重试次数", min_value=1, max_value=10,
+                                      value=int(cap.get("rss_retries", 3)), step=1)
 
         st.markdown("---")
         st.markdown("**华为探测配置**")
@@ -1381,6 +1486,7 @@ def _render_config_form(cfg):
             "base_url": base_url, "api_key": api_key, "model": model, "timeout": timeout,
             "regions": regions, "charts": charts, "feed_limit": feed_limit,
             "max_benchmarks": max_benchmarks, "llm_input_limit": llm_input_limit,
+            "rss_retries": rss_retries,
             "max_comments_per_app": max_comments_per_app,
             "bad_rating_threshold": bad_rating_threshold, "max_competitors": max_competitors,
             "max_keywords_per_benchmark": max_keywords_per_benchmark,
@@ -1493,7 +1599,8 @@ def render_console(cfg, opportunities):
     if c4.button("仅审计", disabled=disabled, use_container_width=True, key="c_aud"):
         _start_run("仅审计", "audit")
         st.rerun()
-    st.caption("全量扫描按 捕获 → 探测 → 审计 顺序执行，任一步失败即中止并保留历史产物。")
+    st.caption("全量扫描按 捕获 → 探测 → 审计 顺序执行；网络/LLM 临时故障会自动重试，"
+               "仍失败则进入「中断」态，修正配置后可点「继续」从失败步骤恢复。")
 
     st.markdown('<div class="panel-title" style="margin-top:18px">执行日志</div>',
                 unsafe_allow_html=True)

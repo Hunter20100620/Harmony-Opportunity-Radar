@@ -3,18 +3,18 @@
 import unittest
 from unittest import mock
 
-from radar.pipeline import PipelineAbortError
+from radar.pipeline import PipelineAbortError, RetryableAbortError
 from radar.pipeline import capture, audit
 
 
 class CaptureFailureTest(unittest.TestCase):
-    def test_all_apple_feeds_fail_aborts(self):
+    def test_all_apple_feeds_fail_is_retryable(self):
         cfg = {"llm": {"model": "m", "base_url": "http://x"},
                "capture": {"regions": ["cn"], "charts": ["top-free"],
                            "feed_limit": 10, "max_benchmarks": 5,
                            "llm_input_limit": 200}}
         with mock.patch.object(capture.apple_rss, "fetch_all", return_value=[]):
-            with self.assertRaises(PipelineAbortError):
+            with self.assertRaises(RetryableAbortError):
                 capture.run(cfg)
 
     def test_llm_connection_failure_aborts_without_overwrite(self):
@@ -40,7 +40,7 @@ class CaptureFailureTest(unittest.TestCase):
                                   side_effect=lambda d: saved.append("raw")), \
                 mock.patch.object(capture.store, "save_benchmarks",
                                   side_effect=lambda d: saved.append("bench")):
-            with self.assertRaises(PipelineAbortError):
+            with self.assertRaises(RetryableAbortError):
                 capture.run(cfg)
         # 原始快照已落盘（便于重跑），但绝不写空 benchmarks
         self.assertIn("raw", saved)
@@ -110,6 +110,25 @@ class AuditFailureInjectionTest(unittest.TestCase):
                "indie_advice": "i"}
         with self.assertRaises(PipelineAbortError):
             self._run([bad], bms, probes)
+
+
+class CliExitCodeTest(unittest.TestCase):
+    """退出码约定：可重试中断 = 2，致命熔断 = 1，成功 = 0。"""
+
+    def _main_rc(self, run_stage_rc):
+        from radar import cli
+        with mock.patch.object(cli, "load_config", return_value={}), \
+                mock.patch.object(cli, "_run_stage", return_value=run_stage_rc):
+            return cli.main(["capture"])
+
+    def test_success_returns_zero(self):
+        self.assertEqual(self._main_rc(5), 0)
+
+    def test_fatal_abort_returns_one(self):
+        self.assertEqual(self._main_rc(-1), 1)
+
+    def test_retryable_abort_returns_two(self):
+        self.assertEqual(self._main_rc(-2), 2)
 
 
 if __name__ == "__main__":

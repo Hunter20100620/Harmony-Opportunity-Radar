@@ -28,6 +28,7 @@ DEFAULTS = {
         "feed_limit": 100,
         "max_benchmarks": 20,
         "llm_input_limit": 200,
+        "rss_retries": 3,
     },
     "probe": {
         "max_comments_per_app": 50,
@@ -104,6 +105,7 @@ def validate_config(cfg: dict) -> list[str]:
     errors += _check_number_range("捕获配置：RSS 榜单条数", cap.get("feed_limit"), 1, 200)
     errors += _check_number_range("捕获配置：精选标杆上限", cap.get("max_benchmarks"), 1, 100)
     errors += _check_number_range("捕获配置：LLM 输入上限", cap.get("llm_input_limit"), 1, 500)
+    errors += _check_number_range("捕获配置：RSS 拉取重试次数", cap.get("rss_retries"), 1, 10)
 
     prb = cfg.get("probe") or {}
     errors += _check_number_range("探测配置：单应用评价上限", prb.get("max_comments_per_app"), 1, 500)

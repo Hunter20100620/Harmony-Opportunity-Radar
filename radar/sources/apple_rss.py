@@ -19,15 +19,18 @@ _CHART_TIMEOUT = {"cn": {"top-free": 60}, "default": 30}
 _CHART_RETRIES = {"cn": {"top-free": 3}, "default": 2}
 
 
-def fetch_chart(region: str, chart: str, limit: int = 100) -> list[dict]:
+def fetch_chart(region: str, chart: str, limit: int = 100,
+                retries: int | None = None) -> list[dict]:
     """拉取单个榜单，返回精简后的应用 dict 列表。
 
     只保留后续 LLM 精选需要的字段。
     内置重试：cn/top-free 极易超时，单独加长超时和重试次数。
+    retries 显式给出时覆盖内置重试次数（供上层按可重试中断调大）。
     """
     url = f"{RSS_BASE}/{region}/apps/{chart}/{limit}/apps.json"
     timeout = _CHART_TIMEOUT.get(region, {}).get(chart, _CHART_TIMEOUT["default"])
-    max_retries = _CHART_RETRIES.get(region, {}).get(chart, _CHART_RETRIES["default"])
+    max_retries = retries if retries is not None else \
+        _CHART_RETRIES.get(region, {}).get(chart, _CHART_RETRIES["default"])
 
     last_err = None
     for attempt in range(1, max_retries + 1):
@@ -57,18 +60,20 @@ def fetch_chart(region: str, chart: str, limit: int = 100) -> list[dict]:
     raise RuntimeError(f"拉取 {region}/{chart} 失败 ({max_retries}次重试): {last_err}")
 
 
-def fetch_all(regions: list[str], charts: list[str], limit: int = 100) -> list[dict]:
+def fetch_all(regions: list[str], charts: list[str], limit: int = 100,
+              retries: int | None = None) -> list[dict]:
     """拉取多个地区 × 多个榜单的全部应用，按 apple_id 主键去重。
 
     去重规则: 优先用 apple_id 作为主键（缺失时回退到名称小写），
     同名不同 apple_id 的应用各自保留，避免名称去重造成静默信息丢失；
     合并其出现来源，并保留原始来源字段。
+    retries 显式给出时透传给 fetch_chart，覆盖内置重试次数。
     """
     seen: dict[str, dict] = {}  # key -> app（跨榜去重用）
     for region in regions:
         for chart in charts:
             try:
-                batch = fetch_chart(region, chart, limit)
+                batch = fetch_chart(region, chart, limit, retries=retries)
             except (httpx.HTTPError, RuntimeError, KeyError, ValueError) as e:
                 # 单个榜单失败不炸整个流水线，打印告警继续
                 print(f"[warn] 拉取 {region}/{chart} 失败: {e}")

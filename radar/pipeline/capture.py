@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 from radar import store, telemetry
 from radar.llm import LLMClient, LLMError
-from radar.pipeline import PipelineAbortError
+from radar.pipeline import PipelineAbortError, RetryableAbortError
 from radar.prompts import CAPTURE_SYSTEM, CAPTURE_USER
 from radar.sources import apple_rss
 
@@ -30,9 +30,11 @@ def run(cfg: dict) -> int:
         regions=cap_cfg["regions"],
         charts=cap_cfg["charts"],
         limit=cap_cfg["feed_limit"],
+        retries=cap_cfg.get("rss_retries"),
     )
     if not apps:
-        raise PipelineAbortError("所有榜单均拉取失败，检查网络后重试")
+        # 榜单全挂通常是网络/上游临时故障，归为可重试中断
+        raise RetryableAbortError("所有榜单均拉取失败，检查网络后重试")
 
     # 原始快照先落盘——即使后续 LLM 失败，也不用重新拉网络
     llm_limit = int(cap_cfg.get("llm_input_limit", 200))
@@ -72,7 +74,7 @@ def run(cfg: dict) -> int:
         picks = llm.chat_json(CAPTURE_SYSTEM, prompt_user, stage=STAGE, target="榜单精选")
     except LLMError as e:
         # LLM 挂了不让整条流水线白跑：原始数据已在盘上，给用户明确指引
-        raise PipelineAbortError(
+        raise RetryableAbortError(
             f"LLM 精选失败: {e}\n"
             f"原始数据已保存在 raw_feed.json，"
             f"修好 LLM 服务（{cfg['llm']['base_url']}）后重跑 capture 即可，无需重新拉取。"
