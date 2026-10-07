@@ -186,5 +186,125 @@ class AuditContractTest(unittest.TestCase):
             self._run(cfg, responses, bms, probes)
 
 
+class AuditEligibilityTest(unittest.TestCase):
+    """主机会资格门槛：证据不足状态不得进入 opportunities。"""
+
+    def _raw(self, v):
+        return _audit_raw(v)
+
+    def test_confirmed_empty_grade_c_blank_signal_is_true(self):
+        bm = _bm("A", "1")
+        probe = {"name": "A", "blank_signal": True,
+                 "probe_status": "confirmed_empty", "evidence_grade": "C",
+                 "competitors": []}
+        item = audit._normalize_audit_result(bm, probe, self._raw(6.9))
+        self.assertTrue(item["is_blank"])
+        self.assertTrue(audit._is_main_eligible(item))
+        self.assertEqual(item["scores"]["experience_gap"], 6.9)
+
+    def test_grade_c_gap_capped_at_seven(self):
+        bm = _bm("A", "1")
+        probe = {"name": "A", "blank_signal": True,
+                 "probe_status": "confirmed_empty", "evidence_grade": "C",
+                 "competitors": []}
+        item = audit._normalize_audit_result(bm, probe, self._raw(9.5))
+        self.assertEqual(item["scores"]["experience_gap"], 7.0)
+        self.assertTrue(item["score_cap_applied"])
+        self.assertEqual(item["scores"]["overall"],
+                         audit._compute_overall(item["scores"]))
+
+    def test_model_overall_cannot_override_computed_value(self):
+        bm = _bm("A", "1")
+        raw = {
+            "scores": {"demand": 7.0, "experience_gap": 7.0,
+                       "native_advantage": 7.0, "indie_feasibility": 7.0,
+                       "overall": 10.0},
+            "verdict": "v", "native_features": [], "attack_vector": "a",
+            "indie_advice": "i",
+        }
+        item = audit._normalize_audit_result(bm, None, raw)
+        self.assertEqual(item["scores"]["overall"], 7.0)
+        self.assertEqual(item["model_overall"], 10.0)
+        self.assertFalse(item["overall_consistent"])
+
+    def test_insufficient_status_is_not_blank_and_not_eligible(self):
+        bm = _bm("A", "1")
+        for status in ("weak_evidence", "no_search_results",
+                       "request_error", "llm_filter_failed", "partial"):
+            probe = {"name": "A", "blank_signal": True,
+                     "probe_status": status, "evidence_grade": "C",
+                     "competitors": []}
+            ctx = audit._build_audit_context(bm, probe)
+            self.assertEqual(ctx["is_blank"], "否（证据不足）",
+                             msg=f"{status} 不得标记为生态空白")
+            item = audit._normalize_audit_result(bm, probe, self._raw(9.0))
+            self.assertFalse(audit._is_main_eligible(item),
+                             msg=f"{status} 不得进入主机会结果")
+
+    def test_insufficient_status_high_score_kept_in_audit_but_not_opportunities(self):
+        bms = [_bm("A", "1")]
+        probes = [{"name": "A", "blank_signal": True,
+                   "probe_status": "weak_evidence", "evidence_grade": "D",
+                   "competitors": []}]
+        responses = [_audit_raw(7.0)]
+        cfg = {"llm": {"model": "m", "base_url": "http://x"},
+               "audit": {"min_score": 6.0}}
+
+        bench = {"benchmarks": bms}
+        probe = {"benchmarks": probes}
+        saved = {}
+
+        def _load(stage):
+            return bench if stage == "benchmarks" else probe
+
+        # 唯一达标项证据不足 → 不得写入主机会结果，触发熔断保护历史
+        with self.assertRaises(PipelineAbortError), \
+                mock.patch.object(audit, "_load_or_fail", side_effect=_load), \
+                mock.patch.object(audit, "LLMClient",
+                                  _fake_llm_factory(responses)), \
+                mock.patch.object(audit.store, "save_opportunities",
+                                  side_effect=lambda d: saved.setdefault("opp", d)), \
+                mock.patch.object(audit.store, "save_audit_results",
+                                  side_effect=lambda d: saved.setdefault("audit_results", d)), \
+                mock.patch.object(audit.store, "save_review_queue",
+                                  side_effect=lambda d: saved.setdefault("review_queue", d)), \
+                mock.patch.object(audit.store, "save_report",
+                                  side_effect=lambda m: saved.setdefault("report", m)):
+            audit.run(cfg)
+
+        self.assertNotIn("opp", saved)
+        self.assertEqual(saved["audit_results"]["total_audited"], 1)
+        self.assertEqual(saved["audit_results"]["total_passed"], 0)
+        self.assertIn("review_queue", saved)
+
+    def test_pending_review_reason_code_for_ineligible_high_score(self):
+        bm = _bm("A", "1")
+        probe = {"name": "A", "apple_id": "1", "blank_signal": True,
+                 "probe_status": "weak_evidence", "evidence_grade": "C",
+                 "competitors": []}
+        item = audit._normalize_audit_result(bm, probe, _audit_raw(6.5))
+        queue = audit._build_review_queue([item], [probe], min_score=6.0)
+        self.assertEqual(len(queue), 1)
+        self.assertIn("pending_review", queue[0]["reason_codes"])
+
+
+class OverallFormulaTest(unittest.TestCase):
+    """综合分必须由代码按固定权重计算，且与维度取值一致。"""
+
+    def test_formula_matches_weighted_sum(self):
+        scores = {"demand": 6.0, "experience_gap": 7.0,
+                  "native_advantage": 5.0, "indie_feasibility": 4.0}
+        expected = round(6.0 * 0.25 + 7.0 * 0.30 + 5.0 * 0.25 + 4.0 * 0.20, 1)
+        self.assertEqual(audit._compute_overall(scores), expected)
+        self.assertEqual(audit._compute_overall(scores), 5.6)
+
+    def test_stable_across_repeated_computation(self):
+        scores = {"demand": 5.5, "experience_gap": 6.0,
+                  "native_advantage": 5.0, "indie_feasibility": 4.5}
+        first = audit._compute_overall(scores)
+        for _ in range(5):
+            self.assertEqual(audit._compute_overall(scores), first)
+
+
 if __name__ == "__main__":
     unittest.main()

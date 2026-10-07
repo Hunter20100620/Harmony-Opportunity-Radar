@@ -55,6 +55,20 @@ class PromptContractTest(unittest.TestCase):
             self.assertEqual(found, builtin,
                              msg=f"{name} 外部模板占位符与内建不一致")
 
+    def test_audit_system_has_c_grade_blank_discipline(self):
+        audit_system = prompts.get_prompt("audit_system")
+        self.assertIn("C 级空白", audit_system)
+        self.assertIn("native_advantage", audit_system)
+        self.assertIn("indie_feasibility", audit_system)
+        self.assertIn("不得同时在多个维度拿到 7 分以上", audit_system)
+
+    def test_external_audit_system_matches_builtin_default(self):
+        path = prompts.prompt_path("audit_system")
+        if not path.exists():
+            self.skipTest("无外部 audit_system 文件")
+        external = path.read_text(encoding="utf-8")
+        self.assertEqual(external, prompts.PROMPT_TEMPLATES["audit_system"]["default"])
+
 
 if __name__ == "__main__":
     unittest.main()

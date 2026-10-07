@@ -87,8 +87,14 @@ def run(cfg: dict | None = None) -> int:
             continue
 
         overall = audit_item["scores"]["overall"]
-        passed = overall >= min_score
-        tag = "✅ 入选" if passed else "⏭ 未达标"
+        eligible = _is_main_eligible(audit_item)
+        passed = overall >= min_score and eligible
+        if passed:
+            tag = "✅ 入选"
+        elif overall >= min_score:
+            tag = "⏭ 未达标（证据不足，转人工复核）"
+        else:
+            tag = "⏭ 未达标"
         print(f"          综合得分: {overall:.1f} {tag}")
         telemetry.progress(STAGE, i, current=name, message=f"{overall:.1f} {tag}")
 
@@ -212,6 +218,19 @@ def _match_probe(probe_idx: dict, bm: dict, bm_idx: dict) -> dict | None:
 # 证据不足或请求失败的状态：不得在提示词中标记为「生态空白」
 _NON_BLANK_STATUSES = ("request_error", "llm_filter_failed",
                        "weak_evidence", "no_search_results", "partial")
+
+# 这些状态的审计结果即使分数达标，也不得进入主机会结果（仅保留在完整审计与复核队列）
+_INELIGIBLE_STATUSES = _NON_BLANK_STATUSES
+
+
+def _is_main_eligible(audit_item: dict) -> bool:
+    """判断审计结果是否有资格进入主机会结果（opportunities）。
+
+    证据不足 / 请求失败 / LLM 过滤失败 / 无检索结果的条目即使分数达标，
+    也只能进入待复核池，不得污染主机会结果。
+    """
+    status = audit_item.get("probe_status", "")
+    return status not in _INELIGIBLE_STATUSES
 
 
 def _build_audit_context(bm: dict, probe_record: dict | None) -> dict:
@@ -475,6 +494,8 @@ def _build_review_queue(audits: list[dict], probes: list[dict],
             reasons.append(status)
         if grade in ("C", "D"):
             reasons.append(f"evidence_grade_{grade}")
+        if overall >= min_score and not _is_main_eligible(item):
+            reasons.append("pending_review")
         if abs(overall - min_score) <= 0.5:
             reasons.append("near_threshold")
 
